@@ -105,6 +105,20 @@ export default function SeatSelectionScreen() {
   const totalKobo = selectionTotals.totalKobo;
   const selectedSeatLabels = selectionTotals.seatLabels;
 
+  // Safe navigation to checkout preview with validated parameters
+  const handleProceedToCheckout = useCallback(() => {
+    if (!movie || !cinema || !showtimeSlot || selectedSeatsList.length === 0) return;
+    router.push({
+      pathname: '/checkout' as any,
+      params: {
+        movieId: movie.id,
+        cinemaId: cinema.id,
+        showtimeId: showtimeSlot.id,
+        seatIds: Array.from(selectedSeatIds).join(','),
+      },
+    });
+  }, [router, movie, cinema, showtimeSlot, selectedSeatIds, selectedSeatsList.length]);
+
   // Graceful Handling for Invalid Session Parameters
   if (!movie || !cinema || !showtimeSlot) {
     return (
@@ -185,7 +199,14 @@ export default function SeatSelectionScreen() {
         ]}
       >
         {selectedSeatsList.length > 0 ? (
-          <View style={styles.selectionSummaryRow}>
+          <TouchableOpacity
+            activeOpacity={0.85}
+            onPress={() => setIsNoticeModalVisible(true)}
+            accessible={true}
+            accessibilityRole="button"
+            accessibilityLabel="View seat selection summary modal"
+            style={styles.selectionSummaryRow}
+          >
             <View style={styles.selectedPillsCol}>
               <View style={styles.countBadgeRow}>
                 <Badge
@@ -218,7 +239,7 @@ export default function SeatSelectionScreen() {
                 {formatKoboToNgn(totalKobo)}
               </Text>
             </View>
-          </View>
+          </TouchableOpacity>
         ) : (
           <View style={styles.emptyPromptRow}>
             <Ionicons name="information-circle-outline" size={20} color={colors.textSecondary} />
@@ -245,11 +266,11 @@ export default function SeatSelectionScreen() {
               color={selectedSeatsList.length > 0 ? colors.background : colors.textSecondary}
             />
           }
-          onPress={() => setIsNoticeModalVisible(true)}
+          onPress={handleProceedToCheckout}
           accessible={true}
           accessibilityRole="button"
-          accessibilityLabel="Continue to checkout notice"
-          accessibilityHint="Proceeds with current seat selection"
+          accessibilityLabel="Continue to checkout preview"
+          accessibilityHint="Proceeds with current seat selection to checkout preview"
         />
       </View>
 
@@ -323,24 +344,36 @@ export default function SeatSelectionScreen() {
               </Text>
             </View>
 
-            <View style={styles.modalActionsRow}>
+            <View style={styles.modalActionsCol}>
               <Button
-                title="Keep Selecting"
-                variant="secondary"
-                size="md"
-                onPress={() => setIsNoticeModalVisible(false)}
-                style={styles.modalBackBtn}
-              />
-              <Button
-                title="Back to Home"
+                title="Proceed to Checkout Preview"
                 variant="primary"
                 size="md"
                 onPress={() => {
                   setIsNoticeModalVisible(false);
-                  router.replace('/');
+                  handleProceedToCheckout();
                 }}
-                style={styles.modalHomeBtn}
+                style={styles.modalFullBtn}
               />
+              <View style={styles.modalActionsRow}>
+                <Button
+                  title="Keep Selecting"
+                  variant="secondary"
+                  size="md"
+                  onPress={() => setIsNoticeModalVisible(false)}
+                  style={styles.modalBackBtn}
+                />
+                <Button
+                  title="Back to Home"
+                  variant="outline"
+                  size="md"
+                  onPress={() => {
+                    setIsNoticeModalVisible(false);
+                    router.replace('/');
+                  }}
+                  style={styles.modalHomeBtn}
+                />
+              </View>
             </View>
           </Card>
         </View>
@@ -514,6 +547,13 @@ const styles = StyleSheet.create({
     flex: 1,
     fontSize: 11,
     lineHeight: 15,
+  },
+  modalActionsCol: {
+    width: '100%',
+    gap: spacing.sm,
+  },
+  modalFullBtn: {
+    width: '100%',
   },
   modalActionsRow: {
     flexDirection: 'row',

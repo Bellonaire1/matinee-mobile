@@ -46,6 +46,8 @@ export default function RootLayout() {
         <Stack.Screen name="movie/[id]" options={{ headerShown: false }} />
         <Stack.Screen name="showtimes/[id]" options={{ headerShown: false }} />
         <Stack.Screen name="seat-selection" options={{ headerShown: false }} />
+        <Stack.Screen name="checkout" options={{ headerShown: false }} />
+        <Stack.Screen name="component-gallery" options={{ headerShown: false }} />
         <Stack.Screen name="+not-found" options={{ title: 'Not Found' }} />
       </Stack>
     </>

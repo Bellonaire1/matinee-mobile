@@ -348,7 +348,7 @@ export default function MovieDetailsScreen() {
       <View style={[styles.bottomStickyBar, { paddingBottom: Math.max(insets.bottom, 16) }]}>
         <View style={styles.priceContainer}>
           <Text variant="caption" color="textSecondary">
-            Ticket Price
+            {isComingSoon ? 'Release Status' : 'Ticket Price'}
           </Text>
           <Text variant="heading2" color="textPrimary" style={styles.priceText}>
             {isComingSoon ? 'Showtimes Open Soon' : movie.priceRange || APPROVED_MOVIE_STARTING_PRICE}
@@ -356,27 +356,29 @@ export default function MovieDetailsScreen() {
         </View>
 
         <Button
-          title={isComingSoon ? 'View Premiere Info' : 'Select Cinema & Showtimes'}
-          variant="primary"
+          title={isComingSoon ? 'Showtimes Open Closer to Premiere' : 'Select Cinema & Showtimes'}
+          variant={isComingSoon ? 'secondary' : 'primary'}
           size="lg"
+          disabled={isComingSoon}
           iconRight={
             <Ionicons
               name={isComingSoon ? 'calendar-outline' : 'ticket'}
               size={18}
-              color={colors.background}
+              color={isComingSoon ? colors.textSecondary : colors.background}
             />
           }
-          onPress={() =>
+          onPress={() => {
+            if (isComingSoon) return;
             router.push({
               pathname: '/showtimes/[id]',
               params: { id: movie.id },
-            } as any)
-          }
+            } as any);
+          }}
           style={styles.bookCTAButton}
           accessible={true}
           accessibilityRole="button"
-          accessibilityLabel="Select cinema and showtimes"
-          accessibilityHint="Navigates to showtime selection for this movie"
+          accessibilityLabel={isComingSoon ? 'Showtimes open closer to premiere' : 'Select cinema and showtimes'}
+          accessibilityHint={isComingSoon ? 'Advance seat reservations are not yet open for upcoming titles' : 'Navigates to showtime selection for this movie'}
         />
       </View>
     </View>

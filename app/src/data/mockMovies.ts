@@ -40,9 +40,9 @@ export const MOCK_GENRES = [
   'All',
   'Sci-Fi',
   'Action',
+  'Adventure',
   'Drama',
   'Animation',
-  'IMAX',
   'Thriller',
 ];
 

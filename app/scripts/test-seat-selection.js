@@ -47,6 +47,8 @@ const mockSeatsPath = path.resolve(__dirname, '../src/data/mockSeats.ts');
 const enginePath = path.resolve(__dirname, '../src/data/seatSelectionEngine.ts');
 const mockCinemasPath = path.resolve(__dirname, '../src/data/mockCinemas.ts');
 const mockMoviesPath = path.resolve(__dirname, '../src/data/mockMovies.ts');
+const checkoutEnginePath = path.resolve(__dirname, '../src/data/checkoutEngine.ts');
+const discoveryEnginePath = path.resolve(__dirname, '../src/data/discoveryEngine.ts');
 
 const {
   generateAuditoriumLayout,
@@ -65,7 +67,33 @@ const {
   formatSelectionModalSubtitle,
 } = loadTs(enginePath);
 const { LAGOS_CINEMAS } = loadTs(mockCinemasPath);
-const { MOCK_FEATURED_MOVIE, MOCK_NOW_SHOWING_MOVIES, MOCK_COMING_SOON_MOVIES } = loadTs(mockMoviesPath);
+const {
+  MOCK_FEATURED_MOVIE,
+  MOCK_NOW_SHOWING_MOVIES,
+  MOCK_COMING_SOON_MOVIES,
+  ALL_MOVIES,
+  MOCK_GENRES,
+  getMovieById,
+} = loadTs(mockMoviesPath);
+const {
+  validateCheckoutContext,
+  parseSeatIdsParam,
+  buildTierReceipts,
+  CHECKOUT_DEMO_DISCLAIMER,
+  CHECKOUT_DEMO_SUBTEXT,
+  DEMO_CHECKOUT_STATES,
+} = loadTs(checkoutEnginePath);
+const {
+  filterMovies,
+  normalizeQuery,
+  isMovieComingSoon,
+  getSearchSummaryText,
+  TICKETS_GUEST_INFO,
+  PROFILE_GUEST_INFO,
+  APP_SYSTEM_DIAGNOSTICS,
+  MOCK_NARRATIVE_GENRES,
+  MOCK_TECHNICAL_FORMATS,
+} = loadTs(discoveryEnginePath);
 
 let totalPassed = 0;
 let totalFailed = 0;
@@ -755,6 +783,631 @@ suite('11. M04.4F Movie Details & Cross-Screen Agreement', () => {
 });
 
 // ---------------------------------------------------------------------------
+// SUITE 12: Checkout Navigation Context & Invariant Validation (M04.5A)
+// ---------------------------------------------------------------------------
+suite('Suite 12: Checkout Navigation Context & Invariant Validation', () => {
+  const validMovieId = 'feat-1'; // Dune Part Two
+  const validCinema = LAGOS_CINEMAS[0]; // Filmhouse IMAX Lekki
+  const validShowtime = validCinema.showtimesByMovie[validMovieId][0]; // 13:30 slot
+
+  runTest('Valid checkout session with available Standard seat returns isValid: true', () => {
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        cinemaId: validCinema.id,
+        showtimeId: validShowtime.id,
+        seatIds: 'B-1,B-2',
+      },
+      seatsById,
+      layout.hallName
+    );
+
+    assert.strictEqual(result.isValid, true);
+    if (result.isValid) {
+      assert.strictEqual(result.movie.title, 'Dune: Part Two');
+      assert.strictEqual(result.cinema.name, validCinema.name);
+      assert.strictEqual(result.showtime.id, validShowtime.id);
+      assert.strictEqual(result.selectedSeatIds.length, 2);
+      assert.strictEqual(result.totalKobo, 1400000);
+      assert.strictEqual(result.formattedTotal, '₦14,000');
+    }
+  });
+
+  runTest('Missing movieId returns isValid: false with MISSING_MOVIE', () => {
+    const result = validateCheckoutContext(
+      {
+        cinemaId: validCinema.id,
+        showtimeId: validShowtime.id,
+        seatIds: 'B-1',
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, false);
+    if (!result.isValid) {
+      assert.strictEqual(result.errorCode, 'MISSING_MOVIE');
+    }
+  });
+
+  runTest('Invalid/unknown movieId returns isValid: false with INVALID_MOVIE', () => {
+    const result = validateCheckoutContext(
+      {
+        movieId: 'non-existent-movie-id',
+        cinemaId: validCinema.id,
+        showtimeId: validShowtime.id,
+        seatIds: 'B-1',
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, false);
+    if (!result.isValid) {
+      assert.strictEqual(result.errorCode, 'INVALID_MOVIE');
+    }
+  });
+
+  runTest('Missing cinemaId returns isValid: false with MISSING_CINEMA', () => {
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        showtimeId: validShowtime.id,
+        seatIds: 'B-1',
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, false);
+    if (!result.isValid) {
+      assert.strictEqual(result.errorCode, 'MISSING_CINEMA');
+    }
+  });
+
+  runTest('Invalid/unknown cinemaId returns isValid: false with INVALID_CINEMA', () => {
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        cinemaId: 'unknown-cinema-id',
+        showtimeId: validShowtime.id,
+        seatIds: 'B-1',
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, false);
+    if (!result.isValid) {
+      assert.strictEqual(result.errorCode, 'INVALID_CINEMA');
+    }
+  });
+
+  runTest('Missing showtimeId returns isValid: false with MISSING_SHOWTIME', () => {
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        cinemaId: validCinema.id,
+        seatIds: 'B-1',
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, false);
+    if (!result.isValid) {
+      assert.strictEqual(result.errorCode, 'MISSING_SHOWTIME');
+    }
+  });
+
+  runTest('Invalid showtimeId returns isValid: false with INVALID_SHOWTIME', () => {
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        cinemaId: validCinema.id,
+        showtimeId: 'fake-showtime-999',
+        seatIds: 'B-1',
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, false);
+    if (!result.isValid) {
+      assert.strictEqual(result.errorCode, 'INVALID_SHOWTIME');
+    }
+  });
+
+  runTest('Empty or missing seatIds returns isValid: false with EMPTY_SEAT_SELECTION', () => {
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        cinemaId: validCinema.id,
+        showtimeId: validShowtime.id,
+        seatIds: '',
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, false);
+    if (!result.isValid) {
+      assert.strictEqual(result.errorCode, 'EMPTY_SEAT_SELECTION');
+    }
+  });
+
+  runTest('Unknown seatId returns isValid: false with INVALID_SEATS', () => {
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        cinemaId: validCinema.id,
+        showtimeId: validShowtime.id,
+        seatIds: 'Z-99',
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, false);
+    if (!result.isValid) {
+      assert.strictEqual(result.errorCode, 'INVALID_SEATS');
+      assert.ok(result.errorMessage.includes('does not exist'));
+    }
+  });
+
+  runTest('Unavailable seat (status held/sold) returns isValid: false with INVALID_SEATS', () => {
+    // Find a sold or held seat in auditorium
+    const unavailableSeat = Object.values(seatsById).find((s) => s.status !== 'available');
+    assert.ok(unavailableSeat, 'Auditorium must contain held/sold seats for testing');
+
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        cinemaId: validCinema.id,
+        showtimeId: validShowtime.id,
+        seatIds: unavailableSeat.id,
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, false);
+    if (!result.isValid) {
+      assert.strictEqual(result.errorCode, 'INVALID_SEATS');
+      assert.ok(result.errorMessage.includes(unavailableSeat.status));
+    }
+  });
+
+  runTest('Broken couple pod (seat without partner) returns isValid: false with INVALID_SEATS', () => {
+    // S-1 is couple seat whose partner is S-2
+    const coupleSeat = seatsById['S-1'];
+    assert.ok(coupleSeat && coupleSeat.isCouple, 'S-1 must be couple seat');
+
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        cinemaId: validCinema.id,
+        showtimeId: validShowtime.id,
+        seatIds: 'S-1', // Partner S-2 intentionally omitted
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, false);
+    if (!result.isValid) {
+      assert.strictEqual(result.errorCode, 'INVALID_SEATS');
+      assert.ok(result.errorMessage.includes('without its partner'));
+    }
+  });
+
+  runTest('Exceeding max seats limit (> 8 seats) returns isValid: false with INVALID_SEATS', () => {
+    // 9 available standard seats: B-1, B-2, B-3, B-5, B-6, B-7, B-9, B-10, B-11
+    const availableSeats = Object.values(seatsById)
+      .filter((s) => s.status === 'available' && !s.isCouple)
+      .slice(0, 9)
+      .map((s) => s.id);
+
+    assert.strictEqual(availableSeats.length, 9);
+
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        cinemaId: validCinema.id,
+        showtimeId: validShowtime.id,
+        seatIds: availableSeats.join(','),
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, false);
+    if (!result.isValid) {
+      assert.strictEqual(result.errorCode, 'INVALID_SEATS');
+      assert.ok(result.errorMessage.includes('exceeds maximum'));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SUITE 13: Checkout Pricing Recalculation & Demo State Verification (M04.5A)
+// ---------------------------------------------------------------------------
+suite('Suite 13: Checkout Pricing Recalculation & Demo State Verification', () => {
+  const validMovieId = 'feat-1';
+  const validCinema = LAGOS_CINEMAS[0];
+  const validShowtime = validCinema.showtimesByMovie[validMovieId][0];
+
+  runTest('Standard seat B-1 price is calculated strictly as ₦7,000 (700,000 kobo)', () => {
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        cinemaId: validCinema.id,
+        showtimeId: validShowtime.id,
+        seatIds: 'B-1',
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, true);
+    if (result.isValid) {
+      assert.strictEqual(result.totalKobo, 700000);
+      assert.strictEqual(result.formattedTotal, '₦7,000');
+    }
+  });
+
+  runTest('Mixed seat tiers (Standard + VIP + Couple) calculate exact integer kobo sum', () => {
+    // 2 Standard (B-1, B-2: 2 * 700,000 = 1,400,000)
+    // 1 VIP (K-5: 1 * 950,000 = 950,000)
+    // 2 Couple (S-1, S-2: 2 * 600,000 = 1,200,000)
+    // Total = 3,550,000 kobo = ₦35,500
+    const mixedSeats = ['B-1', 'B-2', 'K-5', 'S-1', 'S-2'];
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        cinemaId: validCinema.id,
+        showtimeId: validShowtime.id,
+        seatIds: mixedSeats.join(','),
+      },
+      seatsById
+    );
+
+    assert.strictEqual(result.isValid, true);
+    if (result.isValid) {
+      assert.strictEqual(result.selectionTotals.count, 5);
+      assert.strictEqual(result.totalKobo, 3550000);
+      assert.strictEqual(result.formattedTotal, '₦35,500');
+
+      // Verify itemized tier receipts
+      const standardReceipt = result.tierReceipts.find((r) => r.tier === 'standard');
+      const vipReceipt = result.tierReceipts.find((r) => r.tier === 'vip');
+      const coupleReceipt = result.tierReceipts.find((r) => r.tier === 'couple');
+
+      assert.ok(standardReceipt && standardReceipt.count === 2 && standardReceipt.formattedSubtotal === '₦14,000');
+      assert.ok(vipReceipt && vipReceipt.count === 1 && vipReceipt.formattedSubtotal === '₦9,500');
+      assert.ok(coupleReceipt && coupleReceipt.count === 2 && coupleReceipt.formattedSubtotal === '₦12,000');
+    }
+  });
+
+  runTest('Couple pod atomicity & pricing: 2 partner seats cost ₦12,000 (₦6,000 per seat)', () => {
+    const result = validateCheckoutContext(
+      {
+        movieId: validMovieId,
+        cinemaId: validCinema.id,
+        showtimeId: validShowtime.id,
+        seatIds: ['S-1', 'S-2'],
+      },
+      seatsById
+    );
+    assert.strictEqual(result.isValid, true);
+    if (result.isValid) {
+      assert.strictEqual(result.selectionTotals.count, 2);
+      assert.strictEqual(result.totalKobo, 1200000);
+      assert.strictEqual(result.formattedTotal, '₦12,000');
+      const coupleReceipt = result.tierReceipts.find((r) => r.tier === 'couple');
+      assert.strictEqual(coupleReceipt.count, 2);
+      assert.strictEqual(coupleReceipt.formattedPricePerSeat, '₦6,000');
+      assert.strictEqual(coupleReceipt.formattedSubtotal, '₦12,000');
+    }
+  });
+
+  runTest('Route parameter tampering: amounts in URL query are ignored; recalculation is domain-driven', () => {
+    // Malicious query parameter attempting to set total to ₦100
+    const tamperedInput = {
+      movieId: validMovieId,
+      cinemaId: validCinema.id,
+      showtimeId: validShowtime.id,
+      seatIds: 'B-1,B-2',
+      total: '100',
+      amount: '0',
+    };
+
+    const result = validateCheckoutContext(tamperedInput, seatsById);
+    assert.strictEqual(result.isValid, true);
+    if (result.isValid) {
+      assert.strictEqual(result.totalKobo, 1400000);
+      assert.strictEqual(result.formattedTotal, '₦14,000');
+      assert.notStrictEqual(result.formattedTotal, '₦100');
+    }
+  });
+
+  runTest('parseSeatIdsParam handles strings, comma-separated lists, Arrays, and Sets', () => {
+    assert.deepStrictEqual(parseSeatIdsParam('B-1, B-2 , B-3'), ['B-1', 'B-2', 'B-3']);
+    assert.deepStrictEqual(parseSeatIdsParam(['B-1', ' B-2 ']), ['B-1', 'B-2']);
+    assert.deepStrictEqual(parseSeatIdsParam(new Set(['B-1', 'B-2'])), ['B-1', 'B-2']);
+    assert.deepStrictEqual(parseSeatIdsParam(''), []);
+    assert.deepStrictEqual(parseSeatIdsParam(null), []);
+    assert.deepStrictEqual(parseSeatIdsParam(undefined), []);
+  });
+
+  runTest('formatSeatCount produces grammatically correct labels across counts 0, 1, 2, 8', () => {
+    assert.strictEqual(formatSeatCount(0), '0 seats');
+    assert.strictEqual(formatSeatCount(1), '1 seat');
+    assert.strictEqual(formatSeatCount(2), '2 seats');
+    assert.strictEqual(formatSeatCount(8), '8 seats');
+  });
+
+  runTest('Checkout Demo disclaimer and demonstration state metadata integrity', () => {
+    // 1. Mandatory Demo Disclaimer
+    assert.strictEqual(
+      CHECKOUT_DEMO_DISCLAIMER,
+      'Demo Checkout Preview — No seats are reserved and no payment will be processed.'
+    );
+    assert.ok(CHECKOUT_DEMO_SUBTEXT.includes('mobile preview mode'));
+
+    // 2. Demo States: Pending, Failed, Expired
+    const demoKeys = Object.keys(DEMO_CHECKOUT_STATES);
+    assert.deepStrictEqual(demoKeys.sort(), ['expired', 'failed', 'pending']);
+
+    for (const key of demoKeys) {
+      const state = DEMO_CHECKOUT_STATES[key];
+      assert.ok(state.title.length > 0, `Demo state ${key} must have title`);
+      assert.strictEqual(state.badgeLabel, 'Demo State — Non-Transactional');
+      assert.ok(state.explanation.includes('production') || state.explanation.includes('demonstrates'), `State ${key} must explain non-transactional context`);
+      assert.ok(state.suggestedActionLabel.length > 0);
+      assert.ok(state.secondaryActionLabel.length > 0);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SUITE 14: Search, Tickets & Profile Discovery Invariants (M04.5B)
+// ---------------------------------------------------------------------------
+suite('Suite 14: Search, Tickets & Profile Discovery Invariants', () => {
+  runTest('normalizeQuery trims whitespace, normalizes casing, and handles null/undefined safely', () => {
+    assert.strictEqual(normalizeQuery('  Dune: Part Two  '), 'dune: part two');
+    assert.strictEqual(normalizeQuery('ACTION'), 'action');
+    assert.strictEqual(normalizeQuery(''), '');
+    assert.strictEqual(normalizeQuery(null), '');
+    assert.strictEqual(normalizeQuery(undefined), '');
+  });
+
+  runTest('filterMovies by title: finds "Dune" (case-insensitive "dune") matching Dune: Part Two', () => {
+    const results = filterMovies(ALL_MOVIES, { query: 'dune' });
+    assert.ok(results.length >= 1, 'Search for "dune" must find at least 1 film');
+    assert.strictEqual(results[0].title, 'Dune: Part Two');
+  });
+
+  runTest('filterMovies by director or actor: finds Denis Villeneuve and Zendaya', () => {
+    const directorResults = filterMovies(ALL_MOVIES, { query: 'Villeneuve' });
+    assert.ok(directorResults.length >= 1, 'Search for "Villeneuve" must match director');
+    assert.strictEqual(directorResults[0].id, 'feat-1');
+
+    const actorResults = filterMovies(ALL_MOVIES, { query: 'Zendaya' });
+    assert.ok(actorResults.length >= 1, 'Search for "Zendaya" must match cast member');
+    assert.strictEqual(actorResults[0].id, 'feat-1');
+  });
+
+  runTest('filterMovies by genre: "Sci-Fi" filters to only films with Sci-Fi in genres', () => {
+    const results = filterMovies(ALL_MOVIES, { genre: 'Sci-Fi' });
+    assert.ok(results.length > 0, 'Sci-Fi genre search must find films');
+    results.forEach((movie) => {
+      assert.ok(
+        movie.genres.map((g) => g.toLowerCase()).includes('sci-fi'),
+        `Movie ${movie.title} must have Sci-Fi in genres`
+      );
+    });
+  });
+
+  runTest('filterMovies with combined query and genre filter', () => {
+    const results = filterMovies(ALL_MOVIES, { query: 'dune', genre: 'Sci-Fi' });
+    assert.ok(results.length >= 1, 'Combined query and genre must match Dune: Part Two');
+    assert.strictEqual(results[0].id, 'feat-1');
+
+    // Mismatched genre + query returns empty
+    const emptyResults = filterMovies(ALL_MOVIES, { query: 'dune', genre: 'Animation' });
+    assert.strictEqual(emptyResults.length, 0, 'Dune must not match Animation genre');
+  });
+
+  runTest('Empty search results: non-matching query returns empty array []', () => {
+    const results = filterMovies(ALL_MOVIES, { query: 'xyz-non-existent-film-999' });
+    assert.strictEqual(results.length, 0);
+  });
+
+  runTest('Clear/empty query and "All" genre returns all catalog movies', () => {
+    const results = filterMovies(ALL_MOVIES, { query: '', genre: 'All' });
+    assert.strictEqual(results.length, ALL_MOVIES.length);
+  });
+
+  runTest('isMovieComingSoon accurately distinguishes Coming Soon from Now Showing films', () => {
+    const comingSoonMovies = ALL_MOVIES.filter(isMovieComingSoon);
+    assert.ok(comingSoonMovies.length > 0, 'Must have coming soon movies in catalog');
+    comingSoonMovies.forEach((m) => {
+      assert.strictEqual(m.category, 'coming_soon');
+    });
+
+    assert.strictEqual(isMovieComingSoon(MOCK_FEATURED_MOVIE), false);
+  });
+
+  runTest('Coming Soon catalog movies have non-bookable status ("Showtimes Open Soon")', () => {
+    const comingSoonMovies = ALL_MOVIES.filter(isMovieComingSoon);
+    comingSoonMovies.forEach((m) => {
+      assert.strictEqual(m.priceRange, 'Showtimes Open Soon');
+    });
+  });
+
+  runTest('Valid movie navigation targets: all filtered movies have valid IDs resolvable via getMovieById', () => {
+    ALL_MOVIES.forEach((movie) => {
+      const resolved = getMovieById(movie.id);
+      assert.ok(resolved, `Movie ID ${movie.id} must resolve in catalog`);
+      assert.strictEqual(resolved.title, movie.title);
+    });
+  });
+
+  runTest('getSearchSummaryText formats correctly across single, plural, query, and genre combinations', () => {
+    assert.strictEqual(getSearchSummaryText(1, 'dune', 'Sci-Fi'), '1 film found for "dune" in Sci-Fi');
+    assert.strictEqual(getSearchSummaryText(3, 'action'), '3 films found for "action"');
+    assert.strictEqual(getSearchSummaryText(4, '', 'Action'), '4 films in Action');
+    assert.strictEqual(getSearchSummaryText(ALL_MOVIES.length), `Showing all ${ALL_MOVIES.length} films`);
+  });
+
+  runTest('TICKETS_GUEST_INFO contains honest guest-state explanation and no fabricated bookings', () => {
+    assert.strictEqual(TICKETS_GUEST_INFO.emptyTitle, 'No Active Digital Tickets');
+    assert.ok(TICKETS_GUEST_INFO.emptyMessage.includes('mobile preview mode'));
+    assert.ok(TICKETS_GUEST_INFO.demoNoticeMessage.includes('No real tickets, payments, or bookings exist'));
+    assert.strictEqual(TICKETS_GUEST_INFO.primaryActionTitle, 'Explore Now Showing Movies');
+  });
+
+  runTest('PROFILE_GUEST_INFO accurately states guest identity, theme, and un-implemented payment status', () => {
+    assert.strictEqual(PROFILE_GUEST_INFO.guestName, 'Guest Preview User');
+    assert.strictEqual(PROFILE_GUEST_INFO.membershipBadge, 'LOCAL PREVIEW');
+    assert.ok(PROFILE_GUEST_INFO.themeDescription.includes('Cinema After Dark'));
+    assert.ok(PROFILE_GUEST_INFO.paymentDescription.includes('Not Implemented'));
+    assert.ok(PROFILE_GUEST_INFO.appVersion.includes('1.0.0'));
+  });
+
+  runTest('APP_SYSTEM_DIAGNOSTICS matches verified application specifications (320 seats, 4 tiers, SDK 58)', () => {
+    assert.strictEqual(APP_SYSTEM_DIAGNOSTICS.seatCount, 320);
+    assert.strictEqual(APP_SYSTEM_DIAGNOSTICS.maxSeatsPerBooking, 8);
+    assert.strictEqual(APP_SYSTEM_DIAGNOSTICS.tiers.length, 4);
+    assert.strictEqual(APP_SYSTEM_DIAGNOSTICS.version, '1.0.0');
+    assert.strictEqual(APP_SYSTEM_DIAGNOSTICS.build, '2');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SUITE 15: Component Gallery & Design System Invariants (M04.5C)
+// ---------------------------------------------------------------------------
+suite('Suite 15: Component Gallery & Design System Invariants', () => {
+  runTest('MOCK_NARRATIVE_GENRES contains narrative categories and excludes projection formats like "IMAX"', () => {
+    assert.ok(Array.isArray(MOCK_NARRATIVE_GENRES));
+    assert.ok(MOCK_NARRATIVE_GENRES.includes('Sci-Fi'));
+    assert.ok(MOCK_NARRATIVE_GENRES.includes('Action'));
+    assert.ok(MOCK_NARRATIVE_GENRES.includes('Adventure'));
+    assert.ok(MOCK_NARRATIVE_GENRES.includes('Drama'));
+    // Strict invariant: 'IMAX' is a format, not a narrative genre
+    assert.strictEqual(MOCK_NARRATIVE_GENRES.includes('IMAX'), false, 'IMAX must not be in narrative genres');
+  });
+
+  runTest('MOCK_TECHNICAL_FORMATS defines Lagos auditorium/projection technical specs', () => {
+    assert.ok(Array.isArray(MOCK_TECHNICAL_FORMATS));
+    assert.ok(MOCK_TECHNICAL_FORMATS.includes('All Formats'));
+    assert.ok(MOCK_TECHNICAL_FORMATS.includes('IMAX'));
+    assert.ok(MOCK_TECHNICAL_FORMATS.includes('VIP'));
+    assert.ok(MOCK_TECHNICAL_FORMATS.includes('Dolby Cinema'));
+    assert.ok(MOCK_TECHNICAL_FORMATS.includes('4DX'));
+  });
+
+  runTest('filterMovies filters by technical format independently (e.g. "IMAX")', () => {
+    const imaxMovies = filterMovies(ALL_MOVIES, { format: 'IMAX' });
+    assert.ok(imaxMovies.length > 0, 'Catalog must contain movies with IMAX format');
+    imaxMovies.forEach((m) => {
+      assert.ok(
+        m.formats.some((f) => f.toLowerCase().includes('imax')),
+        `Movie ${m.title} must have IMAX format variant`
+      );
+    });
+  });
+
+  runTest('filterMovies supports simultaneous query, genre, and format filtering', () => {
+    const combined = filterMovies(ALL_MOVIES, {
+      query: 'dune',
+      genre: 'Sci-Fi',
+      format: 'IMAX',
+    });
+    assert.strictEqual(combined.length, 1);
+    assert.strictEqual(combined[0].id, 'feat-1');
+
+    // Incompatible format returns empty
+    const impossible = filterMovies(ALL_MOVIES, {
+      query: 'dune',
+      format: '4DX', // Dune mock only has IMAX, Dolby Cinema, VIP
+    });
+    assert.strictEqual(impossible.length, 0);
+  });
+
+  runTest('getSearchSummaryText formats multi-dimensional summaries including technical formats', () => {
+    assert.strictEqual(
+      getSearchSummaryText(2, '', 'All', 'IMAX'),
+      '2 films in IMAX'
+    );
+    assert.strictEqual(
+      getSearchSummaryText(1, 'dune', 'Sci-Fi', 'IMAX'),
+      '1 film found for "dune" in Sci-Fi (IMAX)'
+    );
+    assert.strictEqual(
+      getSearchSummaryText(3, 'action', 'All', 'VIP'),
+      '3 films found for "action" (VIP)'
+    );
+  });
+
+  runTest('APP_SYSTEM_DIAGNOSTICS reflects exact manifest versions without fake runtime test claims', () => {
+    assert.strictEqual(APP_SYSTEM_DIAGNOSTICS.sdk, 'Expo SDK ~58.0.23');
+    assert.strictEqual(APP_SYSTEM_DIAGNOSTICS.router, 'Expo Router ~58.0.30');
+    assert.strictEqual(APP_SYSTEM_DIAGNOSTICS.reactNative, 'React Native 0.88.1');
+    assert.strictEqual(APP_SYSTEM_DIAGNOSTICS.react, 'React 19.3.0');
+    assert.strictEqual(APP_SYSTEM_DIAGNOSTICS.seatCount, 320);
+    assert.strictEqual(APP_SYSTEM_DIAGNOSTICS.maxSeatsPerBooking, 8);
+    // Invariant: runtime diagnostics object must not fabricate test run results
+    assert.strictEqual(APP_SYSTEM_DIAGNOSTICS['automatedTests'], undefined);
+  });
+
+  runTest('Design system primitives exist on disk and export valid React components', () => {
+    const uiDir = path.resolve(__dirname, '../src/components/ui');
+    const inputPath = path.join(uiDir, 'Input.tsx');
+    const skeletonPath = path.join(uiDir, 'Skeleton.tsx');
+    const toastPath = path.join(uiDir, 'Toast.tsx');
+    const bottomSheetPath = path.join(uiDir, 'BottomSheet.tsx');
+    const indexPath = path.join(uiDir, 'index.ts');
+
+    assert.ok(fs.existsSync(inputPath), 'Input.tsx must exist');
+    assert.ok(fs.existsSync(skeletonPath), 'Skeleton.tsx must exist');
+    assert.ok(fs.existsSync(toastPath), 'Toast.tsx must exist');
+    assert.ok(fs.existsSync(bottomSheetPath), 'BottomSheet.tsx must exist');
+    assert.ok(fs.existsSync(indexPath), 'ui/index.ts must exist');
+
+    const indexContent = fs.readFileSync(indexPath, 'utf8');
+    assert.ok(indexContent.includes('Input'), 'ui/index.ts must export Input');
+    assert.ok(indexContent.includes('Skeleton'), 'ui/index.ts must export Skeleton');
+    assert.ok(indexContent.includes('Toast'), 'ui/index.ts must export Toast');
+    assert.ok(indexContent.includes('BottomSheet'), 'ui/index.ts must export BottomSheet');
+  });
+
+  runTest('Component Gallery (SCR-11) screen exists and covers all 12 design system categories', () => {
+    const galleryPath = path.resolve(__dirname, '../src/app/component-gallery.tsx');
+    assert.ok(fs.existsSync(galleryPath), 'component-gallery.tsx must exist');
+
+    const content = fs.readFileSync(galleryPath, 'utf8');
+
+    // 12 core design categories per screen-inventory.md SCR-11
+    const requiredCategories = [
+      'Typography',
+      'Buttons',
+      'Cards',
+      'MovieCards',
+      'Inputs',
+      'Chips',
+      'Badges',
+      'BottomSheets',
+      'Skeletons',
+      'Toasts',
+      'EmptyStates',
+      'SeatMap',
+    ];
+
+    for (const cat of requiredCategories) {
+      assert.ok(
+        content.includes(cat),
+        `Component Gallery must include category: ${cat}`
+      );
+    }
+  });
+
+  runTest('Coming Soon category movies are protected from active showtime booking flows', () => {
+    const comingSoonMovies = ALL_MOVIES.filter(isMovieComingSoon);
+    assert.ok(comingSoonMovies.length > 0);
+
+    comingSoonMovies.forEach((movie) => {
+      // Invariant: Coming soon movie category must not have active showtimes scheduled
+      LAGOS_CINEMAS.forEach((cinema) => {
+        const slots = cinema.showtimesByMovie[movie.id] || [];
+        assert.strictEqual(
+          slots.length,
+          0,
+          `Coming Soon movie ${movie.title} must have 0 active showtimes in ${cinema.name}`
+        );
+      });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // TEST SUMMARY
 // ---------------------------------------------------------------------------
 console.log(`\n======================================================`);
@@ -768,7 +1421,7 @@ if (totalFailed > 0) {
   console.error(`\n❌ TEST SUITE FAILED`);
   process.exit(1);
 } else {
-  console.log(`\n✅ ALL 11 SUITES PASSED VERIFICATION`);
+  console.log(`\n✅ ALL 15 SUITES PASSED VERIFICATION`);
   process.exit(0);
 }
 

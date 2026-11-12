@@ -17,6 +17,7 @@ export interface SearchBarProps {
   placeholder?: string;
   value?: string;
   onChangeText?: (text: string) => void;
+  onClear?: () => void;
   onPress?: () => void;
   isReadOnly?: boolean;
   style?: StyleProp<ViewStyle>;
@@ -26,6 +27,7 @@ export const SearchBar: React.FC<SearchBarProps> = ({
   placeholder = 'Search movies, cinemas, genres...',
   value,
   onChangeText,
+  onClear,
   onPress,
   isReadOnly = false,
   style,
@@ -49,11 +51,26 @@ export const SearchBar: React.FC<SearchBarProps> = ({
           value={value}
           onChangeText={onChangeText}
           style={styles.input}
+          returnKeyType="search"
+          autoCorrect={false}
         />
       )}
-      <View style={styles.actionIconContainer}>
-        <Ionicons name="options-outline" size={18} color={colors.primary} />
-      </View>
+      {value && onClear ? (
+        <TouchableOpacity
+          activeOpacity={0.7}
+          onPress={onClear}
+          accessible={true}
+          accessibilityRole="button"
+          accessibilityLabel="Clear search input"
+          style={styles.actionIconContainer}
+        >
+          <Ionicons name="close-circle" size={18} color={colors.textSecondary} />
+        </TouchableOpacity>
+      ) : (
+        <View style={styles.actionIconContainer}>
+          <Ionicons name="options-outline" size={18} color={colors.primary} />
+        </View>
+      )}
     </View>
   );
 
