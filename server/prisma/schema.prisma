@@ -1,0 +1,402 @@
+// Prisma Schema for Matinee Cinema Ticket Booking Platform
+// Database: PostgreSQL
+// Currency: Integer Kobo (Minor units: 100 kobo = 1 NGN)
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ---------------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------------
+
+enum Role {
+  CUSTOMER
+  CINEMA_ADMIN
+  SYSTEM_ADMIN
+}
+
+enum MovieCategory {
+  NOW_SHOWING
+  COMING_SOON
+  TRENDING
+}
+
+enum SeatTier {
+  STANDARD
+  VIP
+  COUPLE
+  ACCESSIBLE
+}
+
+enum ScreenFormat {
+  STANDARD_2D
+  IMAX_70MM
+  IMAX_3D
+  DOLBY_CINEMA
+  DOLBY_ATMOS
+  VIP_RECLINER
+  FOUR_DX
+}
+
+enum ShowtimeStatus {
+  SCHEDULED
+  OPEN_FOR_BOOKING
+  CANCELLED
+  COMPLETED
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  EXPIRED
+  REFUNDED
+}
+
+enum TicketStatus {
+  PENDING_PAYMENT
+  CONFIRMED
+  CANCELLED
+  REFUNDED_RELEASED
+  REFUNDED_RESTRICTED
+  CHECKED_IN
+}
+
+enum PaymentProvider {
+  TEST_GATEWAY
+  STRIPE_TEST
+  PAYSTACK_TEST
+  FLUTTERWAVE_TEST
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+enum IdempotencyStatus {
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+}
+
+enum WebhookProcessingStatus {
+  PROCESSED
+  IGNORED
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// MODELS
+// ---------------------------------------------------------------------------
+
+/// Registered user account (optional for guest checkouts)
+model User {
+  id              String            @id @default(uuid())
+  email           String            @unique
+  phone           String?
+  fullName        String?
+  role            Role              @default(CUSTOMER)
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+
+  bookings        Booking[]
+  idempotencyKeys IdempotencyRecord[]
+
+  @@map("users")
+}
+
+/// Catalog film metadata synced from TMDB via backend proxy
+model Movie {
+  id              String         @id @default(uuid())
+  tmdbId          Int?           @unique @map("tmdb_id")
+  title           String
+  tagline         String?
+  synopsis        String         @db.Text
+  posterUrl       String?        @map("poster_url")
+  backdropUrl     String?        @map("backdrop_url")
+  runtime         Int            // Duration in minutes
+  ageRating       String         @map("age_rating") // e.g., "PG-13", "R", "18"
+  releaseYear     Int            @map("release_year")
+  releaseDate     DateTime?      @map("release_date")
+  language        String         @default("English")
+  genres          String[]       // Narrative genres: ["Sci-Fi", "Action", "Adventure"]
+  formats         String[]       // Projection formats: ["IMAX", "Dolby Cinema", "VIP"]
+  rating          Decimal?       @db.Decimal(3, 1) // e.g. 8.8
+  votesCount      Int            @default(0) @map("votes_count")
+  director        String?
+  cast            Json?          // Array of { name, character, avatarUrl }
+  category        MovieCategory  @default(NOW_SHOWING)
+  isActive        Boolean        @default(true) @map("is_active")
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  showtimes       Showtime[]
+
+  @@map("movies")
+}
+
+/// Cinema theater location in Lagos
+model Cinema {
+  id              String         @id @default(uuid())
+  name            String         // e.g., "Silverbird Cinemas Ikeja City Mall"
+  chain           String?        // e.g., "Silverbird", "Genesis", "Filmhouse"
+  neighborhood    String         // e.g., "Ikeja", "Victoria Island", "Lekki"
+  address         String
+  city            String         @default("Lagos")
+  country         String         @default("Nigeria")
+  latitude        Float?
+  longitude       Float?
+  features        String[]       // ["IMAX", "VIP Lounge", "Dolby Atmos", "Recliners"]
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  auditoriums     Auditorium[]
+
+  @@map("cinemas")
+}
+
+/// Physical auditorium / screening hall in a cinema.
+/// Standard hall capacity is 320 seats (20 rows x 16 columns).
+/// 20 rows are labeled A through V, strictly omitting letters 'I' and 'O'
+/// per standard cinema industry convention (A, B, C, D, E, F, G, H, J, K, L, M, N, P, Q, R, S, T, U, V).
+model Auditorium {
+  id               String         @id @default(uuid())
+  cinemaId         String         @map("cinema_id")
+  cinema           Cinema         @relation(fields: [cinemaId], references: [id], onDelete: Cascade)
+  name             String         // e.g., "Screen 1 - Grand Auditorium"
+  screenNumber     Int            @map("screen_number")
+  totalSeats       Int            @default(320) @map("total_seats")
+  supportedFormats String[]       @map("supported_formats")
+  isActive         Boolean        @default(true) @map("is_active")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  seats            Seat[]
+  showtimes        Showtime[]
+
+  @@unique([cinemaId, screenNumber])
+  @@map("auditoriums")
+}
+
+/// Physical seat in an auditorium.
+/// Permanent structural record independent of showtimes.
+///
+/// SEAT MATRIX (320 Seats Total across 20 Rows):
+/// - Rows 1 to 20: Exactly 16 columns each (1..16).
+/// - Row A (Row 1): 4 Accessible (cols 1, 2, 15, 16) + 12 Standard companion (cols 3..14)
+/// - Rows B..J (Rows 2..9, 8 rows): 128 Standard seats (tier = STANDARD)
+///   -> Total Standard = 12 + 128 = 140 seats
+/// - Rows K..R (Rows 10..16, 7 rows): 112 VIP Recliner seats (tier = VIP)
+/// - Rows S..V (Rows 17..20, 4 rows): 64 Couple Lounger seats (tier = COUPLE, 32 pairs)
+/// - Total: 4 Accessible + 140 Standard + 112 VIP + 64 Couple = 320 seats.
+model Seat {
+  id               String         @id @default(uuid())
+  auditoriumId     String         @map("auditorium_id")
+  auditorium       Auditorium     @relation(fields: [auditoriumId], references: [id], onDelete: Cascade)
+  row              String         // 20 letters: 'A'..'V' omitting 'I' and 'O' (A,B,C,D,E,F,G,H,J,K,L,M,N,P,Q,R,S,T,U,V)
+  column           Int            // 1 through 16
+  seatNumber       String         @map("seat_number") // Display label: e.g. "G8", "A1", "S1"
+  tier             SeatTier       @default(STANDARD)
+  isAccessible     Boolean        @default(false) @map("is_accessible")
+  isCouple         Boolean        @default(false) @map("is_couple")
+
+  // Self-relation to couple partner seat in pair pod (atomicity support)
+  couplePartnerId  String?        @map("couple_partner_id")
+  couplePartner    Seat?          @relation("CouplePair", fields: [couplePartnerId], references: [id])
+  pairedBy         Seat[]         @relation("CouplePair")
+
+  isActive         Boolean        @default(true) @map("is_active")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  tickets          Ticket[]
+
+  @@unique([auditoriumId, row, column])
+  @@unique([auditoriumId, seatNumber])
+  @@map("seats")
+}
+
+/// Scheduled movie screening session in a specific auditorium
+model Showtime {
+  id                  String          @id @default(uuid())
+  movieId             String          @map("movie_id")
+  movie               Movie           @relation(fields: [movieId], references: [id])
+  auditoriumId        String          @map("auditorium_id")
+  auditorium          Auditorium      @relation(fields: [auditoriumId], references: [id])
+  startTime           DateTime        @map("start_time")
+  endTime             DateTime        @map("end_time")
+  format              ScreenFormat    @default(STANDARD_2D)
+
+  // Explicit tier pricing in integer kobo for this screening
+  basePriceKobo       Int             @default(700000) @map("base_price_kobo")        // Standard: ₦7,000
+  vipPriceKobo        Int             @default(950000) @map("vip_price_kobo")         // VIP: ₦9,500
+  couplePairPriceKobo Int             @default(1200000) @map("couple_pair_price_kobo") // Couple pair: ₦12,000 (₦6,000/seat)
+  accessiblePriceKobo Int             @default(700000) @map("accessible_price_kobo")  // Accessible: ₦7,000
+
+  status              ShowtimeStatus  @default(SCHEDULED)
+  createdAt           DateTime        @default(now()) @map("created_at")
+  updatedAt           DateTime        @updatedAt @map("updated_at")
+
+  bookings            Booking[]
+  tickets             Ticket[]
+
+  @@index([movieId, startTime])
+  @@index([auditoriumId, startTime])
+  @@map("showtimes")
+}
+
+/// Customer reservation order spanning up to 8 seats
+model Booking {
+  id                 String           @id @default(uuid())
+  bookingReference   String           @unique @map("booking_reference") // e.g. "MAT-8942-X7"
+  userId             String?          @map("user_id")
+  user               User?            @relation(fields: [userId], references: [id])
+  showtimeId         String           @map("showtime_id")
+  showtime           Showtime         @relation(fields: [showtimeId], references: [id])
+
+  status             BookingStatus    @default(PENDING)
+  seatCount          Int              @map("seat_count") // Must be between 1 and 8
+
+  // Monetary figures stored in integer kobo (minor units: 100 kobo = ₦1 NGN)
+  subtotalKobo       Int              @map("subtotal_kobo")
+  bookingFeeKobo     Int              @default(0) @map("booking_fee_kobo")
+  totalKobo          Int              @map("total_kobo")
+
+  contactEmail       String           @map("contact_email")
+  contactPhone       String?          @map("contact_phone")
+  contactName        String?          @map("contact_name")
+
+  expiresAt          DateTime?        @map("expires_at") // Checkout session TTL
+  confirmedAt        DateTime?        @map("confirmed_at")
+  cancelledAt        DateTime?        @map("cancelled_at")
+  cancellationReason String?          @map("cancellation_reason")
+
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @updatedAt @map("updated_at")
+
+  tickets            Ticket[]
+  paymentAttempts    PaymentAttempt[]
+
+  @@index([userId])
+  @@index([showtimeId, status])
+  @@index([createdAt])
+  @@map("bookings")
+}
+
+/// Individual ticket representing an allocated seat for a showtime.
+///
+/// ARCHITECTURAL NOTE ON UNIQUENESS & CANCELLATIONS:
+/// In PostgreSQL, active double-booking prevention must be enforced at the database level:
+///   CREATE UNIQUE INDEX uq_active_showtime_seat
+///   ON tickets (showtime_id, seat_id)
+///   WHERE status IN ('PENDING_PAYMENT', 'CONFIRMED', 'CHECKED_IN', 'REFUNDED_RESTRICTED');
+///
+/// An unconditional @@unique([showtimeId, seatId]) is deliberately avoided here because:
+/// If a customer cancels a booking (status -> CANCELLED or REFUNDED_RELEASED), an unconditional unique
+/// constraint would prevent any other customer from subsequently booking that seat for the same showtime,
+/// or would force destructive deletion of historical tickets, violating financial audit trails.
+/// The partial unique index guarantees absolute zero double-bookings for active tickets while
+/// cleanly supporting cancellations and rebookings. Crucially, REFUNDED_RESTRICTED keeps the seat
+/// blocked so post-showtime disputes or maintenance issues cannot lead to unauthorized resale.
+model Ticket {
+  id              String        @id @default(uuid())
+  ticketCode      String        @unique @map("ticket_code") // e.g. "TKT-8942-G8"
+  bookingId       String        @map("booking_id")
+  booking         Booking       @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  showtimeId      String        @map("showtime_id")
+  showtime        Showtime      @relation(fields: [showtimeId], references: [id])
+  seatId          String        @map("seat_id")
+  seat            Seat          @relation(fields: [seatId], references: [id])
+
+  tier            SeatTier
+  priceKobo       Int           @map("price_kobo") // Price paid for this seat allocation
+  status          TicketStatus  @default(CONFIRMED)
+  qrPayload       String?       @map("qr_payload") // Cryptographically signed validation payload
+
+  checkedInAt     DateTime?     @map("checked_in_at")
+  cancelledAt     DateTime?     @map("cancelled_at")
+
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  @@index([showtimeId, seatId])
+  @@index([bookingId])
+  @@map("tickets")
+}
+
+/// Transaction attempt record for payment tracking and reconciliation.
+/// PCI-DSS: Strictly stores NO card numbers (PAN) or verification codes (CVV).
+model PaymentAttempt {
+  id                     String           @id @default(uuid())
+  bookingId              String           @map("booking_id")
+  booking                Booking          @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+
+  provider               PaymentProvider  @default(TEST_GATEWAY)
+  providerTransactionId  String?          @unique @map("provider_transaction_id")
+  idempotencyKey         String?          @map("idempotency_key")
+
+  amountKobo             Int              @map("amount_kobo")
+  currency               String           @default("NGN")
+  status                 PaymentStatus    @default(PENDING)
+  paymentMethod          String?          @map("payment_method") // e.g., "MOCK_CARD", "CARD", "USSD"
+
+  errorCode              String?          @map("error_code")
+  errorMessage           String?          @map("error_message")
+  metadata               Json?            // Sanitized provider response metadata
+
+  createdAt              DateTime         @default(now()) @map("created_at")
+  updatedAt              DateTime         @updatedAt @map("updated_at")
+
+  @@index([bookingId])
+  @@index([provider, status])
+  @@map("payment_attempts")
+}
+
+/// Idempotency store guaranteeing that duplicate requests with the same
+/// Idempotency-Key header are executed exactly once.
+model IdempotencyRecord {
+  key             String            @id // UUID v4 supplied by client
+  userId          String?           @map("user_id")
+  user            User?             @relation(fields: [userId], references: [id])
+
+  requestPath     String            @map("request_path")
+  requestMethod   String            @map("request_method")
+  requestHash     String            @map("request_hash") // SHA-256 of normalized request body
+  status          IdempotencyStatus @default(IN_PROGRESS)
+
+  responseCode    Int?              @map("response_code")
+  responseBody    Json?             @map("response_body")
+
+  expiresAt       DateTime          @map("expires_at") // Expiration TTL (e.g. 24h retention)
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+
+  @@index([expiresAt])
+  @@map("idempotency_records")
+}
+
+/// Deduplication ledger for webhook event processing.
+/// Guarantees that asynchronous provider events are processed at most once.
+model ProcessedWebhookEvent {
+  id          String                   @id // Provider's unique event ID (e.g. "evt_test_123456")
+  provider    PaymentProvider
+  eventType   String                   @map("event_type")
+  status      WebhookProcessingStatus  @default(PROCESSED)
+  error       String?
+  processedAt DateTime                 @default(now()) @map("processed_at")
+
+  @@index([provider, eventType])
+  @@map("processed_webhook_events")
+}
+
