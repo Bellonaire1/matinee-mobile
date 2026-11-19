@@ -101,7 +101,9 @@ describe('Cinemas API (/api/v1/cinemas)', () => {
             id: 'auditorium-1',
             name: 'Screen 1',
             screenNumber: 1,
-            totalSeats: 320,
+            _count: {
+              seats: 320,
+            },
           },
         },
         {
@@ -130,7 +132,9 @@ describe('Cinemas API (/api/v1/cinemas)', () => {
             id: 'auditorium-1',
             name: 'Screen 1',
             screenNumber: 1,
-            totalSeats: 320,
+            _count: {
+              seats: 320,
+            },
           },
         },
       ];
@@ -146,17 +150,79 @@ describe('Cinemas API (/api/v1/cinemas)', () => {
       expect(res.body).toHaveProperty('status', 'success');
       expect(res.body.data).toHaveLength(2);
 
-      // Verify OPEN_FOR_BOOKING screening
+      // Verify OPEN_FOR_BOOKING screening with physical seats
       expect(res.body.data[0].id).toBe('showtime-open');
       expect(res.body.data[0].status).toBe('OPEN_FOR_BOOKING');
       expect(res.body.data[0].isBookable).toBe(true);
       expect(res.body.data[0].bookingWindowStatus).toBe('OPEN');
+      expect(res.body.data[0].auditorium.totalSeats).toBe(320);
+      expect(res.body.data[0].auditorium.hasConfiguredSeats).toBe(true);
 
       // Verify SCHEDULED screening (never represented as bookable)
       expect(res.body.data[1].id).toBe('showtime-scheduled');
       expect(res.body.data[1].status).toBe('SCHEDULED');
       expect(res.body.data[1].isBookable).toBe(false);
       expect(res.body.data[1].bookingWindowStatus).toBe('OPENS_SOON');
+    });
+
+    it('marks screenings in empty auditoriums as isBookable=false and SEATS_UNAVAILABLE', async () => {
+      vi.spyOn(prisma.cinema, 'findUnique').mockResolvedValue({
+        id: 'cin-genesis-palms',
+        name: 'Genesis Deluxe Cinemas',
+      } as any);
+
+      const futureDate = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+      const mockShowtimes = [
+        {
+          id: 'st-empty-auditorium',
+          auditoriumId: 'aud-genesis-palms-01',
+          movieId: 'mov-dune-2',
+          startTime: futureDate,
+          endTime: new Date(futureDate.getTime() + 2 * 60 * 60 * 1000),
+          format: 'DOLBY_CINEMA',
+          basePriceKobo: 700000,
+          vipPriceKobo: 950000,
+          couplePairPriceKobo: 1200000,
+          accessiblePriceKobo: 700000,
+          status: 'OPEN_FOR_BOOKING',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          movie: {
+            id: 'mov-dune-2',
+            title: 'Dune: Part Two',
+            posterUrl: 'https://image.tmdb.org/t/p/w500/poster1.jpg',
+            ageRating: 'PG-13',
+            runtime: 166,
+            genres: ['Sci-Fi'],
+          },
+          auditorium: {
+            id: 'aud-genesis-palms-01',
+            name: 'Screen 1',
+            screenNumber: 1,
+            _count: {
+              seats: 0, // No physical seats configured
+            },
+          },
+        },
+      ];
+
+      vi.spyOn(prisma.showtime, 'findMany').mockResolvedValue(mockShowtimes as any);
+
+      const res = await testRequest(app, {
+        method: 'GET',
+        url: '/api/v1/cinemas/cin-genesis-palms/showtimes',
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.data).toHaveLength(1);
+      // Invariant: Even though status is OPEN_FOR_BOOKING in DB, zero seats => never bookable
+      expect(res.body.data[0].isBookable).toBe(false);
+      expect(res.body.data[0].bookingWindowStatus).toBe('SEATS_UNAVAILABLE');
+      expect(res.body.data[0].totalSeats).toBe(0);
+      expect(res.body.data[0].hasConfiguredSeats).toBe(false);
+      expect(res.body.data[0].auditorium.totalSeats).toBe(0);
+      expect(res.body.data[0].auditorium.hasConfiguredSeats).toBe(false);
     });
 
     it('filters showtimes using Lagos-local day boundaries (+01:00)', async () => {

@@ -32,6 +32,8 @@ export interface FormattedShowtime {
     id: string;
     name: string;
     screenNumber: number;
+    totalSeats: number;
+    hasConfiguredSeats: boolean;
   };
   startTime: string;
   endTime: string;
@@ -43,8 +45,10 @@ export interface FormattedShowtime {
     accessiblePriceKobo: number;
   };
   status: ShowtimeStatus;
+  totalSeats: number;
+  hasConfiguredSeats: boolean;
   isBookable: boolean;
-  bookingWindowStatus: 'OPEN' | 'OPENS_SOON' | 'CLOSED';
+  bookingWindowStatus: 'OPEN' | 'OPENS_SOON' | 'CLOSED' | 'SEATS_UNAVAILABLE';
 }
 
 export class CinemaService {
@@ -125,7 +129,13 @@ export class CinemaService {
       where,
       include: {
         movie: true,
-        auditorium: true,
+        auditorium: {
+          include: {
+            _count: {
+              select: { seats: true },
+            },
+          },
+        },
       },
       orderBy: { startTime: 'asc' },
     });
@@ -134,8 +144,14 @@ export class CinemaService {
 
     return showtimes.map((st) => {
       const isFuture = new Date(st.startTime) > now;
-      const isBookable = st.status === ShowtimeStatus.OPEN_FOR_BOOKING && isFuture;
-      const bookingWindowStatus = isBookable
+      const totalPhysicalSeats = st.auditorium._count.seats;
+      const hasConfiguredSeats = totalPhysicalSeats > 0;
+      const isBookable =
+        st.status === ShowtimeStatus.OPEN_FOR_BOOKING && isFuture && hasConfiguredSeats;
+
+      const bookingWindowStatus = !hasConfiguredSeats
+        ? 'SEATS_UNAVAILABLE'
+        : isBookable
         ? 'OPEN'
         : st.status === ShowtimeStatus.SCHEDULED && isFuture
         ? 'OPENS_SOON'
@@ -156,6 +172,8 @@ export class CinemaService {
           id: st.auditorium.id,
           name: st.auditorium.name,
           screenNumber: st.auditorium.screenNumber,
+          totalSeats: totalPhysicalSeats,
+          hasConfiguredSeats,
         },
         startTime: st.startTime.toISOString(),
         endTime: st.endTime.toISOString(),
@@ -167,6 +185,8 @@ export class CinemaService {
           accessiblePriceKobo: st.accessiblePriceKobo,
         },
         status: st.status,
+        totalSeats: totalPhysicalSeats,
+        hasConfiguredSeats,
         isBookable,
         bookingWindowStatus,
       };

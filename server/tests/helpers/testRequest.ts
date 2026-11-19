@@ -30,6 +30,13 @@ export function testRequest(
         : JSON.stringify(options.body)
       : null;
 
+    const normalizedHeaders: Record<string, string> = {};
+    if (options.headers) {
+      for (const [k, v] of Object.entries(options.headers)) {
+        normalizedHeaders[k.toLowerCase()] = v;
+      }
+    }
+
     req.headers = {
       host: 'localhost',
       'user-agent': 'test-agent',
@@ -40,7 +47,7 @@ export function testRequest(
             'content-length': Buffer.byteLength(payload, 'utf8').toString(),
           }
         : {}),
-      ...(options.headers || {}),
+      ...normalizedHeaders,
     };
 
     const res = new ServerResponse(req);

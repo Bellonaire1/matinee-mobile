@@ -114,4 +114,125 @@ describe('Live Neon Database Discovery Verification', () => {
     expect(res.body.status).toBe('error');
     expect(res.body.code).toBe('CINEMA_NOT_FOUND');
   });
+
+  it('GET /api/v1/cinemas/:id/showtimes accurately marks empty auditoriums as non-bookable', async () => {
+    // Genesis Palms has an OPEN_FOR_BOOKING showtime but 0 physical seats
+    const res = await testRequest(app, {
+      method: 'GET',
+      url: '/api/v1/cinemas/cin-genesis-palms/showtimes',
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('success');
+    expect(res.body.data.length).toBeGreaterThanOrEqual(1);
+
+    const showtime = res.body.data[0];
+    expect(showtime.id).toBe('st-dune-genesis-1600');
+    expect(showtime.hasConfiguredSeats).toBe(false);
+    expect(showtime.totalSeats).toBe(0);
+    expect(showtime.isBookable).toBe(false);
+    expect(showtime.bookingWindowStatus).toBe('SEATS_UNAVAILABLE');
+  });
+
+  describe('Showtime Seat Inventory API (/api/v1/showtimes/:id/seats)', () => {
+    it('returns exact 320-seat layout for Filmhouse reference hall with accurate occupancy and pricing', async () => {
+      const res = await testRequest(app, {
+        method: 'GET',
+        url: '/api/v1/showtimes/st-dune-lekki-1430/seats',
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('success');
+      const data = res.body.data;
+
+      expect(data.showtimeId).toBe('st-dune-lekki-1430');
+      expect(data.cinema.name).toBe('Filmhouse Cinemas IMAX');
+      expect(data.auditorium.name).toBe('Screen 1 (Laser IMAX & Recliners)');
+      expect(data.auditorium.hasConfiguredSeats).toBe(true);
+
+      // Verify total seat count: 320 seats
+      expect(data.totalSeats).toBe(320);
+      expect(data.seats).toHaveLength(320);
+
+      // Verify tier distribution: 4 Accessible, 140 Standard, 112 VIP, 64 Couple
+      const accessibleSeats = data.seats.filter((s: any) => s.tier === 'ACCESSIBLE');
+      const standardSeats = data.seats.filter((s: any) => s.tier === 'STANDARD');
+      const vipSeats = data.seats.filter((s: any) => s.tier === 'VIP');
+      const coupleSeats = data.seats.filter((s: any) => s.tier === 'COUPLE');
+
+      expect(accessibleSeats).toHaveLength(4);
+      expect(standardSeats).toHaveLength(140);
+      expect(vipSeats).toHaveLength(112);
+      expect(coupleSeats).toHaveLength(64);
+
+      // Verify 32 couple pairs with bidirectional partner linkage
+      const couplePodPartners = new Set<string>();
+      for (const seat of coupleSeats) {
+        expect(seat.isCouple).toBe(true);
+        expect(seat.couplePartnerId).not.toBeNull();
+        couplePodPartners.add(seat.couplePartnerId);
+      }
+      expect(couplePodPartners.size).toBe(64); // Each partner is referenced
+
+      // Verify pricing model matches specification
+      // Standard: ₦7,000 (700000 kobo), Accessible: ₦7,000, VIP: ₦9,500 (950000 kobo), Couple: ₦6,000 per seat (600000 kobo)
+      expect(accessibleSeats[0].priceKobo).toBe(700000);
+      expect(standardSeats[0].priceKobo).toBe(700000);
+      expect(vipSeats[0].priceKobo).toBe(950000);
+      expect(coupleSeats[0].priceKobo).toBe(600000);
+
+      // Verify occupancy:
+      // Confirmed tickets: E7, E8 -> OCCUPIED
+      // Refunded restricted: L7 -> OCCUPIED
+      // Cancelled: F1 -> AVAILABLE
+      const seatE7 = data.seats.find((s: any) => s.seatNumber === 'E7');
+      const seatE8 = data.seats.find((s: any) => s.seatNumber === 'E8');
+      const seatL7 = data.seats.find((s: any) => s.seatNumber === 'L7');
+      const seatF1 = data.seats.find((s: any) => s.seatNumber === 'F1');
+
+      expect(seatE7.status).toBe('OCCUPIED');
+      expect(seatE8.status).toBe('OCCUPIED');
+      expect(seatL7.status).toBe('OCCUPIED');
+      expect(seatF1.status).toBe('AVAILABLE');
+
+      expect(data.occupiedSeats).toBe(3);
+      expect(data.availableSeats).toBe(317);
+
+      // Verify PII is stripped
+      for (const seat of data.seats) {
+        expect(seat).not.toHaveProperty('userId');
+        expect(seat).not.toHaveProperty('bookingId');
+        expect(seat).not.toHaveProperty('customerEmail');
+      }
+    });
+
+    it('returns empty inventory cleanly for auditorium with zero physical seats', async () => {
+      const res = await testRequest(app, {
+        method: 'GET',
+        url: '/api/v1/showtimes/st-dune-genesis-1600/seats',
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('success');
+      const data = res.body.data;
+
+      expect(data.showtimeId).toBe('st-dune-genesis-1600');
+      expect(data.auditorium.hasConfiguredSeats).toBe(false);
+      expect(data.totalSeats).toBe(0);
+      expect(data.availableSeats).toBe(0);
+      expect(data.occupiedSeats).toBe(0);
+      expect(data.seats).toEqual([]);
+    });
+
+    it('returns 404 for non-existent showtime', async () => {
+      const res = await testRequest(app, {
+        method: 'GET',
+        url: '/api/v1/showtimes/st-non-existent-id/seats',
+      });
+
+      expect(res.status).toBe(404);
+      expect(res.body.status).toBe('error');
+      expect(res.body.code).toBe('SHOWTIME_NOT_FOUND');
+    });
+  });
 });
