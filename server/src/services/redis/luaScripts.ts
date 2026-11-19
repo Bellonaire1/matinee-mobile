@@ -160,6 +160,18 @@ return 0
 `;
 
 /**
+ * Atomically releases a lock key only if the current value matches the lock owner nonce.
+ * Prevents a slow or expired request from deleting a replacement lock acquired by a newer request.
+ */
+export const RELEASE_LOCK_LUA = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+else
+  return 0
+end
+`;
+
+/**
  * Atomically records completed idempotency result only if the worker still holds the lock.
  * Prevents a stale worker from overwriting a newer request's lock or record.
  */

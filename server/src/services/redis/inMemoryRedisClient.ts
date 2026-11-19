@@ -5,6 +5,7 @@ import {
   EXTEND_HOLD_LUA,
   RELEASE_IDEMPOTENCY_LOCK_LUA,
   COMPLETE_IDEMPOTENCY_LUA,
+  RELEASE_LOCK_LUA,
 } from './luaScripts.js';
 
 interface MemoryEntry {
@@ -322,6 +323,23 @@ export class InMemoryRedisClient implements IRedisClient {
         } catch {
           // ignore
         }
+      }
+      return 0;
+    }
+
+    // 6. RELEASE GENERIC LOCK (COMPARE AND DELETE VIA ARGV[1])
+    if (
+      script === RELEASE_LOCK_LUA ||
+      (script.includes("redis.call('GET', KEYS[1]) == ARGV[1]") &&
+        script.includes("redis.call('DEL', KEYS[1])"))
+    ) {
+      const key = keys[0];
+      const expectedNonce = String(argv[0]);
+      this.cleanExpired(key);
+      const entry = this.store.get(key);
+      if (entry && entry.value === expectedNonce) {
+        this.store.delete(key);
+        return 1;
       }
       return 0;
     }

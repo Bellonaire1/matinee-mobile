@@ -532,10 +532,12 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
       });
 
       // Must succeed with original booking without requiring an active Redis hold
-      expect(res.status).toBe(201);
+      expect(res.status).toBe(200);
+      expect(res.headers['idempotency-replay']).toBe('true');
       expect(res.body.data.id).toBe('bk-original-001');
       expect(res.body.data.bookingReference).toBe('MAT-8888-LOST');
       expect(res.body.data._meta).toBeUndefined(); // Internal metadata must not leak
+      expect(res.body.data.isReplay).toBeUndefined(); // Internal controller flag stripped
     });
 
     it('rejects wrong caller attempting to replay booking without proof of hold token', async () => {
@@ -585,7 +587,7 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
         },
       });
 
-      expect(resWrongToken.status).toBe(409);
+      expect(resWrongToken.status).toBe(403);
       expect(resWrongToken.body.code).toBe('HOLD_TOKEN_POSSESSION_REQUIRED');
       expect(resWrongToken.body.message).toContain('Proof of possession');
     });
@@ -808,8 +810,9 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
       expect(holdAfter).not.toBeNull();
     });
 
-    it('safe degradation: failure to release Redis hold after DB commit does NOT fail booking', async () => {
+    it('safe degradation: failure to release Redis hold after DB commit does NOT log secret token or fail booking', async () => {
       const holdToken = await acquireTestHold(['seat-b1']);
+      const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
       const mockBookingRecord = {
         id: 'bk-safe-001',
@@ -876,6 +879,112 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
       // Response MUST still succeed with 201 because the database transaction committed
       expect(res.status).toBe(201);
       expect(res.body.data.bookingReference).toBe('MAT-9999-SAFE');
+
+      // PHASE 1 VERIFICATION: Full secret capability token MUST NOT appear in logs
+      expect(consoleWarnSpy).toHaveBeenCalled();
+      for (const callArgs of consoleWarnSpy.mock.calls) {
+        const fullMessage = callArgs.map(String).join(' ');
+        expect(fullMessage).not.toContain(holdToken);
+      }
+
+      // Secret token MUST NOT leak in the HTTP response body
+      expect(JSON.stringify(res.body)).not.toContain(holdToken);
+      consoleWarnSpy.mockRestore();
+    });
+
+    describe('Booking-Lock Lifecycle & Atomic Nonce Compare-and-Delete (Phase 2)', () => {
+      it('prevents concurrent checkouts on the same hold with 409 BOOKING_IN_PROGRESS', async () => {
+        const holdToken = await acquireTestHold(['seat-b1']);
+        const lockKey = `matinee:hold_booking_lock:${holdToken}`;
+
+        // Pre-set lock simulating Request 1 in flight
+        await memoryRedis.set(lockKey, 'active-owner-nonce', 'EX', 60);
+
+        const res = await testRequest(app, {
+          method: 'POST',
+          url: '/api/v1/bookings',
+          headers: {
+            'X-Hold-Token': holdToken,
+            'Idempotency-Key': 'bk-concurrent-test-key-1',
+          },
+          body: {
+            showtimeId: mockShowtime.id,
+            seatIds: ['seat-b1'],
+            contactEmail: 'customer2@example.com',
+          },
+        });
+
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe('BOOKING_IN_PROGRESS');
+      });
+
+      it('enforces 60-second TTL on booking lock, allowing replacement acquisition after expiry', async () => {
+        const holdToken = await acquireTestHold(['seat-b1']);
+        const lockKey = `matinee:hold_booking_lock:${holdToken}`;
+
+        // Acquire lock with 60s TTL
+        await memoryRedis.set(lockKey, 'owner-a-nonce', 'EX', 60);
+        const ttlBefore = await memoryRedis.ttl(lockKey);
+        expect(ttlBefore).toBeGreaterThan(0);
+        expect(ttlBefore).toBeLessThanOrEqual(60);
+
+        // Simulate TTL expiry
+        memoryRedis.expireKeyNow(lockKey);
+        expect(await memoryRedis.get(lockKey)).toBeNull();
+
+        // New owner can now acquire
+        const acquired = await memoryRedis.set(lockKey, 'owner-b-nonce', 'EX', 60, 'NX');
+        expect(acquired).toBe('OK');
+        expect(await memoryRedis.get(lockKey)).toBe('owner-b-nonce');
+      });
+
+      it('stale-owner cleanup safety: stale request does NOT delete replacement lock acquired by newer request', async () => {
+        const holdToken = await acquireTestHold(['seat-b1']);
+        const lockKey = `matinee:hold_booking_lock:${holdToken}`;
+
+        // 1. Request A acquired lock with nonceA
+        const nonceA = 'owner-a-stale-nonce';
+        await memoryRedis.set(lockKey, nonceA, 'EX', 60);
+
+        // 2. Request A times out; lock expires and Request B acquires with nonceB
+        const nonceB = 'owner-b-active-nonce';
+        await memoryRedis.set(lockKey, nonceB, 'EX', 60);
+
+        // 3. Request A finally block runs with its stale nonceA using RELEASE_LOCK_LUA
+        const { RELEASE_LOCK_LUA } = await import('../src/services/redis/luaScripts.js');
+        const released = await memoryRedis.eval(RELEASE_LOCK_LUA, 1, lockKey, nonceA);
+
+        // Must NOT delete Request B's lock!
+        expect(released).toBe(0);
+        expect(await memoryRedis.get(lockKey)).toBe(nonceB);
+
+        // 4. Request B's cleanup runs with nonceB: successfully deletes lock
+        const bReleased = await memoryRedis.eval(RELEASE_LOCK_LUA, 1, lockKey, nonceB);
+        expect(bReleased).toBe(1);
+        expect(await memoryRedis.get(lockKey)).toBeNull();
+      });
+
+      it('maps Redis outage during lock acquisition to 503 HOLD_SERVICE_UNAVAILABLE', async () => {
+        const holdToken = await acquireTestHold(['seat-b1']);
+        vi.spyOn(memoryRedis, 'set').mockRejectedValueOnce(new Error('Redis connection refused'));
+
+        const res = await testRequest(app, {
+          method: 'POST',
+          url: '/api/v1/bookings',
+          headers: {
+            'X-Hold-Token': holdToken,
+            'Idempotency-Key': validKey,
+          },
+          body: {
+            showtimeId: mockShowtime.id,
+            seatIds: ['seat-b1'],
+            contactEmail: 'customer@example.com',
+          },
+        });
+
+        expect(res.status).toBe(503);
+        expect(res.body.code).toBe('HOLD_SERVICE_UNAVAILABLE');
+      });
     });
 
     it('creates couple pod booking with 2 partner tickets and exact ₦12,000 total', async () => {
@@ -947,10 +1056,9 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
     });
   });
 
-  describe('5. Expiration vs Payment Settlement Safety (Phase 2 Scenarios A-G)', () => {
+  describe('5. Expiration vs Payment Settlement Safety (Phase 3 Scenarios A-G)', () => {
     it('Scenario A: Expiration wins before settlement', async () => {
       const now = new Date();
-      // Candidate query finds 1 expired booking
       vi.spyOn(prisma.booking, 'findMany').mockResolvedValue([{ id: 'bk-expired-a' }] as any);
 
       const updateTicketsMock = vi.fn().mockResolvedValue({ count: 1 });
@@ -959,7 +1067,12 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
       vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
         const tx = {
           booking: {
-            findMany: vi.fn().mockResolvedValue([{ id: 'bk-expired-a' }]), // Re-verified eligible
+            findUnique: vi.fn().mockResolvedValue({
+              id: 'bk-expired-a',
+              status: BookingStatus.PENDING,
+              expiresAt: new Date(now.getTime() - 60000),
+              paymentAttempts: [],
+            }),
             updateMany: updateBookingsMock,
           },
           ticket: {
@@ -972,28 +1085,35 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
       const count = await bookingService.expireAbandonedBookings(now);
       expect(count).toBe(1);
       expect(updateBookingsMock).toHaveBeenCalledWith({
-        where: { id: { in: ['bk-expired-a'] }, status: BookingStatus.PENDING },
+        where: { id: 'bk-expired-a', status: BookingStatus.PENDING },
         data: expect.objectContaining({ status: BookingStatus.EXPIRED }),
       });
       expect(updateTicketsMock).toHaveBeenCalledWith({
-        where: { bookingId: { in: ['bk-expired-a'] }, status: TicketStatus.PENDING_PAYMENT },
+        where: { bookingId: 'bk-expired-a', status: TicketStatus.PENDING_PAYMENT },
         data: expect.objectContaining({ status: TicketStatus.CANCELLED }),
       });
     });
 
     it('Scenario B: Settlement wins before expiration (Booking already CONFIRMED)', async () => {
       const now = new Date();
-      // Candidate search found booking earlier, but inside transaction it is already CONFIRMED
       vi.spyOn(prisma.booking, 'findMany').mockResolvedValue([{ id: 'bk-confirmed-b' }] as any);
+
+      const updateBookingsMock = vi.fn();
+      const updateTicketsMock = vi.fn();
 
       vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
         const tx = {
           booking: {
-            findMany: vi.fn().mockResolvedValue([]), // In-tx check: no longer PENDING!
-            updateMany: vi.fn(),
+            findUnique: vi.fn().mockResolvedValue({
+              id: 'bk-confirmed-b',
+              status: BookingStatus.CONFIRMED,
+              expiresAt: new Date(now.getTime() - 60000),
+              paymentAttempts: [{ status: PaymentStatus.SUCCEEDED }],
+            }),
+            updateMany: updateBookingsMock,
           },
           ticket: {
-            updateMany: vi.fn(),
+            updateMany: updateTicketsMock,
           },
         };
         return cb(tx);
@@ -1001,21 +1121,30 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
 
       const count = await bookingService.expireAbandonedBookings(now);
       expect(count).toBe(0); // Safely skipped
+      expect(updateBookingsMock).not.toHaveBeenCalled();
+      expect(updateTicketsMock).not.toHaveBeenCalled();
     });
 
     it('Scenario C: Two expiration workers target the same booking concurrently', async () => {
       const now = new Date();
       vi.spyOn(prisma.booking, 'findMany').mockResolvedValue([{ id: 'bk-competing-c' }] as any);
 
+      const updateTicketsMock = vi.fn();
+
       // Worker 2 runs: updateMany returns count: 0 because Worker 1 already flipped status to EXPIRED
       vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
         const tx = {
           booking: {
-            findMany: vi.fn().mockResolvedValue([{ id: 'bk-competing-c' }]),
+            findUnique: vi.fn().mockResolvedValue({
+              id: 'bk-competing-c',
+              status: BookingStatus.PENDING,
+              expiresAt: new Date(now.getTime() - 60000),
+              paymentAttempts: [],
+            }),
             updateMany: vi.fn().mockResolvedValue({ count: 0 }), // Competitor won!
           },
           ticket: {
-            updateMany: vi.fn(),
+            updateMany: updateTicketsMock,
           },
         };
         return cb(tx);
@@ -1023,22 +1152,31 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
 
       const count = await bookingService.expireAbandonedBookings(now);
       expect(count).toBe(0);
+      // Confirmed expired IDs only: ticket cancellation must NOT be executed
+      expect(updateTicketsMock).not.toHaveBeenCalled();
     });
 
     it('Scenario D: Payment becomes PROCESSING during reconciliation', async () => {
       const now = new Date();
       vi.spyOn(prisma.booking, 'findMany').mockResolvedValue([{ id: 'bk-settling-d' }] as any);
 
+      const updateBookingsMock = vi.fn();
+      const updateTicketsMock = vi.fn();
+
       // In-transaction re-check sees a paymentAttempt in PROCESSING
       vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
         const tx = {
           booking: {
-            // Re-check filters out bookings with PROCESSING payment
-            findMany: vi.fn().mockResolvedValue([]),
-            updateMany: vi.fn(),
+            findUnique: vi.fn().mockResolvedValue({
+              id: 'bk-settling-d',
+              status: BookingStatus.PENDING,
+              expiresAt: new Date(now.getTime() - 60000),
+              paymentAttempts: [{ status: PaymentStatus.PROCESSING }],
+            }),
+            updateMany: updateBookingsMock,
           },
           ticket: {
-            updateMany: vi.fn(),
+            updateMany: updateTicketsMock,
           },
         };
         return cb(tx);
@@ -1046,21 +1184,30 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
 
       const count = await bookingService.expireAbandonedBookings(now);
       expect(count).toBe(0);
+      expect(updateBookingsMock).not.toHaveBeenCalled();
+      expect(updateTicketsMock).not.toHaveBeenCalled();
     });
 
     it('Scenario E: Payment is already SUCCEEDED', async () => {
       const now = new Date();
       vi.spyOn(prisma.booking, 'findMany').mockResolvedValue([{ id: 'bk-paid-e' }] as any);
 
+      const updateBookingsMock = vi.fn();
+      const updateTicketsMock = vi.fn();
+
       vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
         const tx = {
           booking: {
-            // Re-check filters out bookings with SUCCEEDED payment
-            findMany: vi.fn().mockResolvedValue([]),
-            updateMany: vi.fn(),
+            findUnique: vi.fn().mockResolvedValue({
+              id: 'bk-paid-e',
+              status: BookingStatus.PENDING,
+              expiresAt: new Date(now.getTime() - 60000),
+              paymentAttempts: [{ status: PaymentStatus.SUCCEEDED }],
+            }),
+            updateMany: updateBookingsMock,
           },
           ticket: {
-            updateMany: vi.fn(),
+            updateMany: updateTicketsMock,
           },
         };
         return cb(tx);
@@ -1068,6 +1215,8 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
 
       const count = await bookingService.expireAbandonedBookings(now);
       expect(count).toBe(0);
+      expect(updateBookingsMock).not.toHaveBeenCalled();
+      expect(updateTicketsMock).not.toHaveBeenCalled();
     });
 
     it('Scenario F: Reconciliation runs repeatedly (strictly idempotent)', async () => {
@@ -1079,17 +1228,45 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
       expect(count).toBe(0);
     });
 
-    it('Scenario G: Database transaction failure and rollback', async () => {
+    it('Scenario G: Individual transaction failure isolation and non-fatal recovery', async () => {
       const now = new Date();
-      vi.spyOn(prisma.booking, 'findMany').mockResolvedValue([{ id: 'bk-rollback-g' }] as any);
+      vi.spyOn(prisma.booking, 'findMany').mockResolvedValue([
+        { id: 'bk-deadlock-1' },
+        { id: 'bk-healthy-2' },
+      ] as any);
 
-      vi.spyOn(prisma, '$transaction').mockRejectedValue(
-        new Error('PostgreSQL deadlock / transaction failure')
-      );
+      const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-      await expect(bookingService.expireAbandonedBookings(now)).rejects.toThrow(
-        'PostgreSQL deadlock'
+      let callIndex = 0;
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        callIndex++;
+        if (callIndex === 1) {
+          throw new Error('PostgreSQL deadlock / transaction serialization error');
+        }
+        const tx = {
+          booking: {
+            findUnique: vi.fn().mockResolvedValue({
+              id: 'bk-healthy-2',
+              status: BookingStatus.PENDING,
+              expiresAt: new Date(now.getTime() - 60000),
+              paymentAttempts: [],
+            }),
+            updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          },
+          ticket: {
+            updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+          },
+        };
+        return cb(tx);
+      });
+
+      // Does not abort entire loop; healthy-2 still succeeds
+      const count = await bookingService.expireAbandonedBookings(now);
+      expect(count).toBe(1);
+      expect(consoleWarnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('bk-deadlock-1')
       );
+      consoleWarnSpy.mockRestore();
     });
   });
 });

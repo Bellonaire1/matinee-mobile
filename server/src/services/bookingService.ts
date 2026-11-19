@@ -10,6 +10,7 @@ import {
 import { default as defaultPrisma } from '../db.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { SeatHoldService, seatHoldService as defaultSeatHoldService } from './seatHoldService.js';
+import { RELEASE_LOCK_LUA } from './redis/luaScripts.js';
 
 export interface CreateBookingInput {
   showtimeId: string;
@@ -47,6 +48,7 @@ export interface BookingResult {
   expiresAt: string | null;
   createdAt: string;
   tickets: BookingTicketItem[];
+  isReplay?: boolean;
 }
 
 function generateBookingReference(): string {
@@ -185,25 +187,29 @@ export class BookingService {
         if (!storedTokenHash || storedTokenHash !== tokenHash) {
           throw new AppError(
             'Proof of possession of the original hold capability token is required to replay this booking',
-            409,
+            403,
             'HOLD_TOKEN_POSSESSION_REQUIRED'
           );
         }
 
         // Return sanitized cached completed response (without internal _meta)
         const { _meta, ...safeResult } = body;
-        return safeResult as BookingResult;
+        return {
+          ...safeResult,
+          isReplay: true,
+        } as BookingResult;
       }
     }
 
     // 3. ATOMIC LOCK ON HOLD TOKEN TO PREVENT CONCURRENT CHECKOUT DUPLICATION
-    // Prevents two different idempotency keys from concurrently checking out the same hold
+    // Uses a unique random lock nonce for safe compare-and-delete ownership release.
     const holdBookingLockKey = `matinee:hold_booking_lock:${cleanToken}`;
+    const lockNonce = crypto.randomUUID();
     let holdLockClaimed = false;
     try {
       const lockAcquired = await this.holdService.redis.set(
         holdBookingLockKey,
-        cleanIdempotencyKey,
+        lockNonce,
         'EX',
         60,
         'NX'
@@ -446,19 +452,24 @@ export class BookingService {
       // 7. Release Redis seat hold AFTER successful database transaction commit
       try {
         await this.holdService.releaseHold(cleanToken);
-      } catch (redisErr) {
+      } catch {
+        // Do not print raw Redis exception messages that could contain credentials, tokens, or command arguments
         console.warn(
-          `[BookingService] Non-fatal notice: Failed to release Redis hold ${cleanToken} after database commit:`,
-          redisErr
+          `[BookingService] Non-fatal notice: Redis hold release failed post-commit for booking ${createdBooking.bookingReference} (id: ${createdBooking.id}) [REDIS_RELEASE_FAILED]`
         );
       }
 
       return createdBooking;
     } finally {
-      // Clean up hold-booking concurrency lock
+      // Clean up hold-booking concurrency lock safely using atomic compare-and-delete
       if (holdLockClaimed) {
         try {
-          await this.holdService.redis.del(holdBookingLockKey);
+          await this.holdService.redis.eval(
+            RELEASE_LOCK_LUA,
+            1,
+            holdBookingLockKey,
+            lockNonce
+          );
         } catch {
           // ignore cleanup error
         }
@@ -470,15 +481,29 @@ export class BookingService {
    * Reconciles expired PENDING bookings (e.g. abandoned checkouts after 15 minutes).
    *
    * Safety & Settlement Guarantees:
-   * 1. Discovery filter finds candidate PENDING bookings with expiresAt < now.
-   * 2. Transactional Re-check: Inside the atomic transaction, re-verifies that:
-   *    a. Booking status is STILL 'PENDING'
-   *    b. Booking has NO payment attempts in 'PROCESSING' or 'SUCCEEDED' state.
-   *       If a customer initiated payment concurrently, the booking is preserved.
-   * 3. Conditional Update: Booking update applies where: { id, status: 'PENDING' }.
-   * 4. Atomic Ticket Cancellation: Transitions tickets to CANCELLED atomically,
-   *    immediately releasing the uq_active_showtime_seat partial unique index for new buyers.
-   * 5. Idempotent across repeated executions and safe for concurrent workers.
+   * 1. Candidate Discovery: Non-locking search for candidates (status: PENDING, expiresAt < now).
+   * 2. Per-Candidate Atomic Transaction:
+   *    Each candidate is evaluated in its own PostgreSQL transaction boundary.
+   * 3. Transactional Boundary Check:
+   *    Inside the transaction, re-inspects the booking including its latest paymentAttempts.
+   *    Eligibility strictly requires:
+   *      a. status === PENDING
+   *      b. expiresAt < now
+   *      c. paymentAttempts has NO records with status in [PROCESSING, SUCCEEDED]
+   * 4. Conditional State Transition:
+   *    Executes conditional update:
+   *      updateMany({ where: { id: candidate.id, status: PENDING }, data: { status: EXPIRED, ... } })
+   *    If count === 0 (e.g. concurrent payment transitioned status or another worker processed it),
+   *    the transaction immediately aborts without touching tickets.
+   * 5. Confirmed-Only Ticket Cancellation:
+   *    Tickets are ONLY cancelled for bookings that actually transitioned to EXPIRED in this exact transaction.
+   *    Targets tickets where bookingId === candidate.id AND status === PENDING_PAYMENT.
+   * 6. Audit & Seat Uniqueness:
+   *    Maintains cancellationReason and cancelledAt timestamps on booking and tickets.
+   *    Transitioning tickets from PENDING_PAYMENT to CANCELLED releases PostgreSQL's partial
+   *    unique constraint uq_active_showtime_seat, safely freeing physical seats.
+   * 7. Worker Isolation:
+   *    Failure or race on one candidate does not compromise or abort reconciliation of other candidates.
    */
   async expireAbandonedBookings(now = new Date()): Promise<number> {
     // 1. Initial discovery of candidate expired bookings
@@ -492,62 +517,88 @@ export class BookingService {
 
     if (candidates.length === 0) return 0;
 
-    const candidateIds = candidates.map((b) => b.id);
+    let reconciledCount = 0;
 
-    // 2. Re-verify eligibility and perform atomic cancellation inside a single PostgreSQL transaction
-    const reconciledCount = await this.prisma.$transaction(async (tx) => {
-      // In-transaction re-check: must still be PENDING and have NO active/succeeded payment attempts
-      const genuinelyEligible = await tx.booking.findMany({
-        where: {
-          id: { in: candidateIds },
-          status: BookingStatus.PENDING,
-          expiresAt: { lt: now },
-          paymentAttempts: {
-            none: {
-              status: { in: [PaymentStatus.PROCESSING, PaymentStatus.SUCCEEDED] },
+    // 2. Process each candidate inside an isolated atomic transaction
+    for (const candidate of candidates) {
+      try {
+        const didExpire = await this.prisma.$transaction(async (tx) => {
+          // Re-fetch inside transaction boundary with fresh payment attempts
+          const booking = await tx.booking.findUnique({
+            where: { id: candidate.id },
+            include: {
+              paymentAttempts: {
+                select: { status: true },
+              },
             },
-          },
-        },
-        select: { id: true },
-      });
+          });
 
-      if (genuinelyEligible.length === 0) {
-        return 0;
+          if (!booking) return false;
+
+          // Check A: Must still be PENDING
+          if (booking.status !== BookingStatus.PENDING) {
+            return false;
+          }
+
+          // Check B: Must still be expired
+          if (!booking.expiresAt || booking.expiresAt >= now) {
+            return false;
+          }
+
+          // Check C: Must NOT have any active or succeeded payment attempts
+          const hasActivePayment = booking.paymentAttempts.some(
+            (p) =>
+              p.status === PaymentStatus.PROCESSING ||
+              p.status === PaymentStatus.SUCCEEDED
+          );
+          if (hasActivePayment) {
+            return false;
+          }
+
+          // Conditional transition: updates booking ONLY if it is still PENDING
+          const updateResult = await tx.booking.updateMany({
+            where: {
+              id: candidate.id,
+              status: BookingStatus.PENDING,
+            },
+            data: {
+              status: BookingStatus.EXPIRED,
+              cancellationReason:
+                'Checkout session expired before payment completion',
+              cancelledAt: now,
+            },
+          });
+
+          // If another worker or payment handler transitioned the booking first, count is 0
+          if (updateResult.count === 0) {
+            return false;
+          }
+
+          // Atomically cancel tickets ONLY for this confirmed expired booking
+          await tx.ticket.updateMany({
+            where: {
+              bookingId: candidate.id,
+              status: TicketStatus.PENDING_PAYMENT,
+            },
+            data: {
+              status: TicketStatus.CANCELLED,
+              cancelledAt: now,
+            },
+          });
+
+          return true;
+        });
+
+        if (didExpire) {
+          reconciledCount++;
+        }
+      } catch {
+        // Individual failure logged with non-sensitive identifiers; does not abort remaining candidates
+        console.warn(
+          `[BookingService] Non-fatal notice: Reconciliation transaction failed for candidate booking ${candidate.id} [RECONCILIATION_FAILED]`
+        );
       }
-
-      const eligibleIds = genuinelyEligible.map((b) => b.id);
-
-      // Atomic conditional update of booking status
-      const bookingUpdateResult = await tx.booking.updateMany({
-        where: {
-          id: { in: eligibleIds },
-          status: BookingStatus.PENDING,
-        },
-        data: {
-          status: BookingStatus.EXPIRED,
-          cancellationReason: 'Checkout session expired before payment completion',
-          cancelledAt: now,
-        },
-      });
-
-      if (bookingUpdateResult.count === 0) {
-        return 0;
-      }
-
-      // Cancel corresponding tickets (releasing uq_active_showtime_seat)
-      await tx.ticket.updateMany({
-        where: {
-          bookingId: { in: eligibleIds },
-          status: TicketStatus.PENDING_PAYMENT,
-        },
-        data: {
-          status: TicketStatus.CANCELLED,
-          cancelledAt: now,
-        },
-      });
-
-      return bookingUpdateResult.count;
-    });
+    }
 
     return reconciledCount;
   }

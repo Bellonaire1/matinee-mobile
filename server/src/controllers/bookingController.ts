@@ -49,6 +49,16 @@ export async function createBooking(
       idempotencyKey,
     });
 
+    if (booking.isReplay) {
+      const { isReplay, ...cleanBooking } = booking;
+      res.set('Idempotency-Replay', 'true');
+      res.status(200).json({
+        status: 'success',
+        data: cleanBooking,
+      });
+      return;
+    }
+
     res.status(201).json({
       status: 'success',
       data: booking,
