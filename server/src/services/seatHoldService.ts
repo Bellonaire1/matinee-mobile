@@ -8,6 +8,8 @@ import {
   ACQUIRE_HOLD_LUA,
   RELEASE_HOLD_LUA,
   EXTEND_HOLD_LUA,
+  RELEASE_IDEMPOTENCY_LOCK_LUA,
+  COMPLETE_IDEMPOTENCY_LUA,
 } from './redis/index.js';
 
 export const HOLD_TTL_SECONDS = 600; // 10 minutes (strict initial window)
@@ -242,11 +244,14 @@ export class SeatHoldService {
       }
 
       // Atomically claim in-progress idempotency lock for 30s to serialize concurrent first requests
+      let lockOwnerId: string | undefined;
       try {
+        lockOwnerId = crypto.randomUUID();
         const lockAcquired = await this.redis.set(
           idempotencyRedisKey,
           JSON.stringify({
             status: 'IN_PROGRESS',
+            lockOwnerId,
             showtimeId,
             sortedSeatIds: uniqueSeatIds,
             createdAt: Date.now(),
@@ -272,27 +277,41 @@ export class SeatHoldService {
           'HOLD_SERVICE_UNAVAILABLE'
         );
       }
+
+      try {
+        return await this.executeAcquisition({
+          showtimeId,
+          uniqueSeatIds,
+          userId,
+          idempotencyRedisKey,
+          idempotencyKey,
+          lockOwnerId,
+        });
+      } catch (err) {
+        // If acquisition fails and an in-progress lock was claimed, delete only if we still own the lock.
+        // Prevents race where a timed-out request's cleanup deletes a replacement lock.
+        if (inProgressLockClaimed && idempotencyRedisKey && lockOwnerId) {
+          try {
+            await this.redis.eval(
+              RELEASE_IDEMPOTENCY_LOCK_LUA,
+              1,
+              idempotencyRedisKey,
+              lockOwnerId
+            );
+          } catch {
+            // ignore cleanup error
+          }
+        }
+        throw err;
+      }
     }
 
-    try {
-      return await this.executeAcquisition({
-        showtimeId,
-        uniqueSeatIds,
-        userId,
-        idempotencyRedisKey,
-        idempotencyKey,
-      });
-    } catch (err) {
-      // If acquisition fails and an in-progress lock was claimed, delete it so caller can retry
-      if (inProgressLockClaimed && idempotencyRedisKey) {
-        try {
-          await this.redis.del(idempotencyRedisKey);
-        } catch {
-          // ignore cleanup error
-        }
-      }
-      throw err;
-    }
+    return await this.executeAcquisition({
+      showtimeId,
+      uniqueSeatIds,
+      userId,
+      idempotencyRedisKey: null,
+    });
   }
 
   private async executeAcquisition(params: {
@@ -301,8 +320,9 @@ export class SeatHoldService {
     userId?: string | null;
     idempotencyRedisKey: string | null;
     idempotencyKey?: string;
+    lockOwnerId?: string;
   }): Promise<SeatHoldResult> {
-    const { showtimeId, uniqueSeatIds, userId, idempotencyRedisKey, idempotencyKey } = params;
+    const { showtimeId, uniqueSeatIds, userId, idempotencyRedisKey, idempotencyKey, lockOwnerId } = params;
 
     // 3. Showtime Verification & Bookability Guard
     const showtime = await this.prisma.showtime.findUnique({
@@ -517,22 +537,36 @@ export class SeatHoldService {
     // 10. Cache Idempotency Key Record if provided
     if (idempotencyRedisKey && idempotencyKey && idempotencyKey.trim()) {
       const cleanKey = idempotencyKey.trim();
+      const completedPayload = JSON.stringify({
+        status: 'COMPLETED',
+        idempotencyKey: cleanKey,
+        showtimeId,
+        sortedSeatIds: uniqueSeatIds,
+        holdToken,
+        result,
+        createdAt: Date.now(),
+        expiresAt: expiresAtMs,
+      });
+
       try {
-        await this.redis.set(
-          idempotencyRedisKey,
-          JSON.stringify({
-            status: 'COMPLETED',
-            idempotencyKey: cleanKey,
-            showtimeId,
-            sortedSeatIds: uniqueSeatIds,
-            holdToken,
-            result,
-            createdAt: Date.now(),
-            expiresAt: expiresAtMs,
-          }),
-          'EX',
-          HOLD_TTL_SECONDS
-        );
+        if (lockOwnerId) {
+          // Atomically transition from IN_PROGRESS to COMPLETED only if this request still owns the lock
+          await this.redis.eval(
+            COMPLETE_IDEMPOTENCY_LUA,
+            1,
+            idempotencyRedisKey,
+            lockOwnerId,
+            completedPayload,
+            HOLD_TTL_SECONDS
+          );
+        } else {
+          await this.redis.set(
+            idempotencyRedisKey,
+            completedPayload,
+            'EX',
+            HOLD_TTL_SECONDS
+          );
+        }
       } catch {
         // Idempotency caching error is non-fatal to the hold itself
       }

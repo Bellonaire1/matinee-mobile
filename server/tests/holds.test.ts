@@ -5,7 +5,11 @@ import { prisma } from '../src/db.js';
 import { ScreenFormat, SeatTier, ShowtimeStatus, TicketStatus } from '@prisma/client';
 import { InMemoryRedisClient } from '../src/services/redis/inMemoryRedisClient.js';
 import { FailingRedisClient } from '../src/services/redis/failingRedisClient.js';
-import { setRedisClient } from '../src/services/redis/index.js';
+import {
+  RELEASE_IDEMPOTENCY_LOCK_LUA,
+  COMPLETE_IDEMPOTENCY_LUA,
+  setRedisClient,
+} from '../src/services/redis/index.js';
 import seatHoldService from '../src/services/seatHoldService.js';
 
 describe('Matinee Seat Hold Engine & Hardened API Security', () => {
@@ -384,8 +388,102 @@ describe('Matinee Seat Hold Engine & Hardened API Security', () => {
   });
 
   describe('3. Heartbeat Renewal & Lifetime Cap Invariants', () => {
-    it('allows at most 1 heartbeat extension and strictly caps maximum hold lifetime', async () => {
-      // 1. Acquire hold (600s TTL)
+    it('immediate heartbeat extends hold to 900s without shortening active 600s window', async () => {
+      // 1. Acquire hold (600s initial window)
+      const resHold = await testRequest(app, {
+        method: 'POST',
+        url: '/api/v1/showtimes/st-dune-lekki-1430/holds',
+        body: { seatIds: ['seat-b1'] },
+      });
+      expect(resHold.status).toBe(201);
+      const token = resHold.body.data.holdToken;
+      const initialExpiresIn = resHold.body.data.expiresInSeconds;
+      expect(initialExpiresIn).toBe(600);
+
+      // 2. Immediate heartbeat within seconds of creation
+      const resExtend = await testRequest(app, {
+        method: 'POST',
+        url: '/api/v1/holds/heartbeat',
+        headers: { 'X-Hold-Token': token },
+      });
+      expect(resExtend.status).toBe(200);
+      expect(resExtend.body.data.extensionCount).toBe(1);
+
+      // Heartbeat MUST extend to 900s (600s + 300s), NEVER shorten to 300s!
+      const extendedExpiresIn = resExtend.body.data.expiresInSeconds;
+      expect(extendedExpiresIn).toBeGreaterThanOrEqual(898);
+      expect(extendedExpiresIn).toBeLessThanOrEqual(900);
+
+      // Verify expiration timestamp is approximately 900s from creation
+      const expiresAtMs = new Date(resExtend.body.data.expiresAt).getTime();
+      const diffMs = expiresAtMs - Date.now();
+      expect(diffMs).toBeGreaterThanOrEqual(895_000);
+      expect(diffMs).toBeLessThanOrEqual(900_000);
+    });
+
+    it('midway heartbeat (+300s) extends hold to exactly 900s total lifetime (600s remaining)', async () => {
+      const now = Date.now();
+      const dateSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
+
+      try {
+        const resHold = await testRequest(app, {
+          method: 'POST',
+          url: '/api/v1/showtimes/st-dune-lekki-1430/holds',
+          body: { seatIds: ['seat-b1'] },
+        });
+        const token = resHold.body.data.holdToken;
+
+        // Advance simulated time by 300 seconds (halfway through 600s hold)
+        dateSpy.mockReturnValue(now + 300_000);
+
+        const resExtend = await testRequest(app, {
+          method: 'POST',
+          url: '/api/v1/holds/heartbeat',
+          headers: { 'X-Hold-Token': token },
+        });
+        expect(resExtend.status).toBe(200);
+        expect(resExtend.body.data.extensionCount).toBe(1);
+
+        // Remaining TTL should be exactly 600s (900s total - 300s elapsed)
+        expect(resExtend.body.data.expiresInSeconds).toBe(600);
+        expect(new Date(resExtend.body.data.expiresAt).getTime()).toBe(now + 900_000);
+      } finally {
+        dateSpy.mockRestore();
+      }
+    });
+
+    it('near-expiry heartbeat (+590s) extends hold to exactly 900s total lifetime (310s remaining)', async () => {
+      const now = Date.now();
+      const dateSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
+
+      try {
+        const resHold = await testRequest(app, {
+          method: 'POST',
+          url: '/api/v1/showtimes/st-dune-lekki-1430/holds',
+          body: { seatIds: ['seat-b1'] },
+        });
+        const token = resHold.body.data.holdToken;
+
+        // Advance simulated time to 590s (10 seconds before expiry)
+        dateSpy.mockReturnValue(now + 590_000);
+
+        const resExtend = await testRequest(app, {
+          method: 'POST',
+          url: '/api/v1/holds/heartbeat',
+          headers: { 'X-Hold-Token': token },
+        });
+        expect(resExtend.status).toBe(200);
+        expect(resExtend.body.data.extensionCount).toBe(1);
+
+        // Remaining TTL should be exactly 310s (900s total - 590s elapsed)
+        expect(resExtend.body.data.expiresInSeconds).toBe(310);
+        expect(new Date(resExtend.body.data.expiresAt).getTime()).toBe(now + 900_000);
+      } finally {
+        dateSpy.mockRestore();
+      }
+    });
+
+    it('strictly caps maximum hold lifetime at 900 seconds from creation', async () => {
       const resHold = await testRequest(app, {
         method: 'POST',
         url: '/api/v1/showtimes/st-dune-lekki-1430/holds',
@@ -393,7 +491,26 @@ describe('Matinee Seat Hold Engine & Hardened API Security', () => {
       });
       const token = resHold.body.data.holdToken;
 
-      // 2. First extension succeeds (adds 300s)
+      const resExtend = await testRequest(app, {
+        method: 'POST',
+        url: '/api/v1/holds/heartbeat',
+        headers: { 'X-Hold-Token': token },
+      });
+      expect(resExtend.status).toBe(200);
+
+      const expiresAtMs = new Date(resExtend.body.data.expiresAt).getTime();
+      expect(expiresAtMs - Date.now()).toBeLessThanOrEqual(900_000);
+    });
+
+    it('rejects second extension attempt (strictly max 1 extension per session)', async () => {
+      const resHold = await testRequest(app, {
+        method: 'POST',
+        url: '/api/v1/showtimes/st-dune-lekki-1430/holds',
+        body: { seatIds: ['seat-b1'] },
+      });
+      const token = resHold.body.data.holdToken;
+
+      // First extension succeeds
       const resExtend1 = await testRequest(app, {
         method: 'POST',
         url: '/api/v1/holds/heartbeat',
@@ -401,9 +518,8 @@ describe('Matinee Seat Hold Engine & Hardened API Security', () => {
       });
       expect(resExtend1.status).toBe(200);
       expect(resExtend1.body.data.extensionCount).toBe(1);
-      expect(resExtend1.body.data.expiresInSeconds).toBeGreaterThan(0);
 
-      // 3. Second extension attempt MUST be rejected (max extensions = 1)
+      // Second extension attempt MUST be rejected
       const resExtend2 = await testRequest(app, {
         method: 'POST',
         url: '/api/v1/holds/heartbeat',
@@ -411,7 +527,35 @@ describe('Matinee Seat Hold Engine & Hardened API Security', () => {
       });
       expect(resExtend2.status).toBe(400);
       expect(resExtend2.body.code).toBe('MAX_HOLD_EXTENSIONS_EXCEEDED');
-      expect(resExtend2.body.message).toContain('limit');
+      expect(resExtend2.body.message).toContain('limit (1) reached');
+    });
+
+    it('synchronizes TTL consistency between token key and seat keys after heartbeat', async () => {
+      const resHold = await testRequest(app, {
+        method: 'POST',
+        url: '/api/v1/showtimes/st-dune-lekki-1430/holds',
+        body: { seatIds: ['seat-b1', 'seat-b2'] },
+      });
+      const token = resHold.body.data.holdToken;
+
+      await testRequest(app, {
+        method: 'POST',
+        url: '/api/v1/holds/heartbeat',
+        headers: { 'X-Hold-Token': token },
+      });
+
+      const tokenKey = `matinee:hold_token:${token}`;
+      const seatKeyB1 = 'matinee:hold:st-dune-lekki-1430:seat-b1';
+      const seatKeyB2 = 'matinee:hold:st-dune-lekki-1430:seat-b2';
+
+      const tokenTtl = await memoryRedis.ttl(tokenKey);
+      const seatB1Ttl = await memoryRedis.ttl(seatKeyB1);
+      const seatB2Ttl = await memoryRedis.ttl(seatKeyB2);
+
+      // All keys must have strictly synchronized TTLs
+      expect(tokenTtl).toBeGreaterThanOrEqual(898);
+      expect(seatB1Ttl).toBe(tokenTtl);
+      expect(seatB2Ttl).toBe(tokenTtl);
     });
 
     it('rejects heartbeat renewal on expired tokens with 404 (prevents resurrection)', async () => {
@@ -433,6 +577,50 @@ describe('Matinee Seat Hold Engine & Hardened API Security', () => {
       });
       expect(resExtend.status).toBe(404);
       expect(resExtend.body.code).toBe('HOLD_NOT_FOUND');
+    });
+
+    it('rejects heartbeat renewal when simulated time exceeds unextended hold window', async () => {
+      const now = Date.now();
+      const dateSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
+
+      try {
+        const resHold = await testRequest(app, {
+          method: 'POST',
+          url: '/api/v1/showtimes/st-dune-lekki-1430/holds',
+          body: { seatIds: ['seat-b1'] },
+        });
+        const token = resHold.body.data.holdToken;
+
+        // Advance simulated time past initial 600s hold (605 seconds)
+        dateSpy.mockReturnValue(now + 605_000);
+
+        const resExtend = await testRequest(app, {
+          method: 'POST',
+          url: '/api/v1/holds/heartbeat',
+          headers: { 'X-Hold-Token': token },
+        });
+        expect(resExtend.status).toBe(404);
+        expect(resExtend.body.code).toBe('HOLD_NOT_FOUND');
+      } finally {
+        dateSpy.mockRestore();
+      }
+    });
+
+    it('rejects heartbeat renewal with mismatched or missing token', async () => {
+      const resMissing = await testRequest(app, {
+        method: 'POST',
+        url: '/api/v1/holds/heartbeat',
+      });
+      expect(resMissing.status).toBe(401);
+      expect(resMissing.body.code).toBe('MISSING_HOLD_TOKEN');
+
+      const resMismatched = await testRequest(app, {
+        method: 'POST',
+        url: '/api/v1/holds/heartbeat',
+        headers: { 'X-Hold-Token': 'non-existent-token-xyz' },
+      });
+      expect(resMismatched.status).toBe(404);
+      expect(resMismatched.body.code).toBe('HOLD_NOT_FOUND');
     });
   });
 
@@ -557,6 +745,120 @@ describe('Matinee Seat Hold Engine & Hardened API Security', () => {
       });
       expect(res.status).toBe(503);
       expect(res.body.code).toBe('HOLD_SERVICE_UNAVAILABLE');
+    });
+  });
+
+  describe('6. Advanced Idempotency Concurrency & Lock Ownership Safety', () => {
+    it('prevents unconditional DEL cleanup race: worker A cannot delete worker B replacement lock', async () => {
+      const lockKey = 'matinee:idempotency:test-key-race';
+
+      // 1. Worker B holds the lock with unique lockOwnerId = 'owner-b'
+      await memoryRedis.set(
+        lockKey,
+        JSON.stringify({
+          status: 'IN_PROGRESS',
+          lockOwnerId: 'owner-b',
+          createdAt: Date.now(),
+        }),
+        'EX',
+        30
+      );
+
+      // 2. Worker A (stale/timed out with 'owner-a') attempts lock cleanup
+      const deleted = await memoryRedis.eval(
+        RELEASE_IDEMPOTENCY_LOCK_LUA,
+        1,
+        lockKey,
+        'owner-a'
+      );
+
+      // Release MUST return 0 and NOT delete Worker B's lock
+      expect(deleted).toBe(0);
+      const remainingVal = await memoryRedis.get(lockKey);
+      expect(remainingVal).not.toBeNull();
+      expect(JSON.parse(remainingVal!).lockOwnerId).toBe('owner-b');
+
+      // 3. Worker B with 'owner-b' executes cleanup: successfully deletes
+      const deletedByB = await memoryRedis.eval(
+        RELEASE_IDEMPOTENCY_LOCK_LUA,
+        1,
+        lockKey,
+        'owner-b'
+      );
+      expect(deletedByB).toBe(1);
+      expect(await memoryRedis.get(lockKey)).toBeNull();
+    });
+
+    it('prevents stale worker from overwriting active lock or completed record', async () => {
+      const lockKey = 'matinee:idempotency:test-key-stale';
+
+      // 1. Active lock owned by 'owner-b'
+      await memoryRedis.set(
+        lockKey,
+        JSON.stringify({
+          status: 'IN_PROGRESS',
+          lockOwnerId: 'owner-b',
+          createdAt: Date.now(),
+        }),
+        'EX',
+        30
+      );
+
+      // 2. Stale Worker A ('owner-a') attempts to complete
+      const completed = await memoryRedis.eval(
+        COMPLETE_IDEMPOTENCY_LUA,
+        1,
+        lockKey,
+        'owner-a',
+        JSON.stringify({ status: 'COMPLETED', result: 'from-stale-a' }),
+        600
+      );
+
+      // Must fail to overwrite
+      expect(completed).toBe(0);
+      const current = JSON.parse((await memoryRedis.get(lockKey))!);
+      expect(current.status).toBe('IN_PROGRESS');
+      expect(current.lockOwnerId).toBe('owner-b');
+
+      // 3. Legitimate Worker B completes successfully
+      const completedByB = await memoryRedis.eval(
+        COMPLETE_IDEMPOTENCY_LUA,
+        1,
+        lockKey,
+        'owner-b',
+        JSON.stringify({ status: 'COMPLETED', result: 'from-legitimate-b' }),
+        600
+      );
+      expect(completedByB).toBe(1);
+      const updated = JSON.parse((await memoryRedis.get(lockKey))!);
+      expect(updated.status).toBe('COMPLETED');
+      expect(updated.result).toBe('from-legitimate-b');
+    });
+
+    it('rejects simultaneous in-progress requests with 409 IDEMPOTENCY_IN_PROGRESS', async () => {
+      // Simulate lock already in progress
+      const key = 'test-concurrent-first';
+      await memoryRedis.set(
+        `matinee:idempotency:${key}`,
+        JSON.stringify({
+          status: 'IN_PROGRESS',
+          lockOwnerId: 'first-worker-uuid',
+          showtimeId: 'st-dune-lekki-1430',
+          sortedSeatIds: ['seat-b1'],
+          createdAt: Date.now(),
+        }),
+        'EX',
+        30
+      );
+
+      const res = await testRequest(app, {
+        method: 'POST',
+        url: '/api/v1/showtimes/st-dune-lekki-1430/holds',
+        headers: { 'Idempotency-Key': key },
+        body: { seatIds: ['seat-b1'] },
+      });
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('IDEMPOTENCY_IN_PROGRESS');
     });
   });
 });

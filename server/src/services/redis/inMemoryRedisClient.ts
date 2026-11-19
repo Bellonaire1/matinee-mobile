@@ -1,26 +1,36 @@
 import { IRedisClient } from './redisInterface.js';
-import { ACQUIRE_HOLD_LUA, RELEASE_HOLD_LUA, EXTEND_HOLD_LUA } from './luaScripts.js';
+import {
+  ACQUIRE_HOLD_LUA,
+  RELEASE_HOLD_LUA,
+  EXTEND_HOLD_LUA,
+  RELEASE_IDEMPOTENCY_LOCK_LUA,
+  COMPLETE_IDEMPOTENCY_LUA,
+} from './luaScripts.js';
 
 interface MemoryEntry {
   value: string;
-  expiresAt: number | null; // epoch ms or null for infinite
+  expiresAt?: number; // timestamp in ms, undefined = no expiration
 }
 
 /**
- * High-fidelity In-Memory Redis client for local development and unit/integration testing.
- * Implements precise millisecond TTL expiry and atomic multi-key operations identical
- * to Redis Lua script execution.
+ * In-memory fallback implementation of IRedisClient for testing and offline environments.
+ * Emulates key expiration, string commands, atomic Lua scripts, and Redis error modes.
  */
 export class InMemoryRedisClient implements IRedisClient {
-  private store = new Map<string, MemoryEntry>();
+  private store: Map<string, MemoryEntry> = new Map();
   private healthy = true;
 
-  constructor(healthy = true) {
-    this.healthy = healthy;
-  }
+  constructor() {}
 
   setHealthy(status: boolean): void {
     this.healthy = status;
+  }
+
+  private cleanExpired(key: string): void {
+    const entry = this.store.get(key);
+    if (entry && entry.expiresAt && Date.now() >= entry.expiresAt) {
+      this.store.delete(key);
+    }
   }
 
   async isHealthy(): Promise<boolean> {
@@ -28,23 +38,12 @@ export class InMemoryRedisClient implements IRedisClient {
   }
 
   async ping(): Promise<string> {
-    if (!this.healthy) {
-      throw new Error('ECONNREFUSED: Redis connection refused (simulated)');
-    }
+    if (!this.healthy) throw new Error('InMemoryRedisClient is down');
     return 'PONG';
   }
 
-  private cleanExpired(key: string): void {
-    const entry = this.store.get(key);
-    if (entry && entry.expiresAt !== null && Date.now() > entry.expiresAt) {
-      this.store.delete(key);
-    }
-  }
-
   async get(key: string): Promise<string | null> {
-    if (!this.healthy) {
-      throw new Error('ECONNREFUSED: Redis connection refused (simulated)');
-    }
+    if (!this.healthy) throw new Error('InMemoryRedisClient is down');
     this.cleanExpired(key);
     const entry = this.store.get(key);
     return entry ? entry.value : null;
@@ -57,11 +56,10 @@ export class InMemoryRedisClient implements IRedisClient {
     duration?: number,
     flag?: 'NX' | 'XX'
   ): Promise<'OK' | null> {
-    if (!this.healthy) {
-      throw new Error('ECONNREFUSED: Redis connection refused (simulated)');
-    }
+    if (!this.healthy) throw new Error('InMemoryRedisClient is down');
     this.cleanExpired(key);
     const exists = this.store.has(key);
+
     if (flag === 'NX' && exists) {
       return null;
     }
@@ -69,20 +67,18 @@ export class InMemoryRedisClient implements IRedisClient {
       return null;
     }
 
-    let expiresAt: number | null = null;
-    if (mode === 'EX' && duration !== undefined) {
-      expiresAt = Date.now() + duration * 1000;
-    } else if (mode === 'PX' && duration !== undefined) {
-      expiresAt = Date.now() + duration;
+    let expiresAt: number | undefined;
+    if (mode && duration !== undefined) {
+      const ms = mode === 'EX' ? duration * 1000 : duration;
+      expiresAt = Date.now() + ms;
     }
+
     this.store.set(key, { value, expiresAt });
     return 'OK';
   }
 
   async del(...keys: string[]): Promise<number> {
-    if (!this.healthy) {
-      throw new Error('ECONNREFUSED: Redis connection refused (simulated)');
-    }
+    if (!this.healthy) throw new Error('InMemoryRedisClient is down');
     let count = 0;
     for (const key of keys) {
       this.cleanExpired(key);
@@ -94,33 +90,31 @@ export class InMemoryRedisClient implements IRedisClient {
   }
 
   async ttl(key: string): Promise<number> {
-    if (!this.healthy) {
-      throw new Error('ECONNREFUSED: Redis connection refused (simulated)');
-    }
+    if (!this.healthy) throw new Error('InMemoryRedisClient is down');
     this.cleanExpired(key);
     const entry = this.store.get(key);
-    if (!entry) return -2;
-    if (entry.expiresAt === null) return -1;
+    if (!entry) return -2; // Key does not exist
+    if (!entry.expiresAt) return -1; // Key exists but has no associated expire
     const remainingMs = entry.expiresAt - Date.now();
     return Math.max(0, Math.ceil(remainingMs / 1000));
   }
 
+  async disconnect(): Promise<void> {
+    this.store.clear();
+  }
+
+  /**
+   * Emulates atomic Redis Lua scripts used in seat holding.
+   */
   async eval(
     script: string,
     numKeys: number,
     ...args: (string | number)[]
   ): Promise<unknown> {
-    if (!this.healthy) {
-      throw new Error('ECONNREFUSED: Redis connection refused (simulated)');
-    }
+    if (!this.healthy) throw new Error('InMemoryRedisClient is down');
 
     const keys = args.slice(0, numKeys).map(String);
-    const argv = args.slice(numKeys).map(String);
-
-    // Clean expired keys before evaluation
-    for (const key of keys) {
-      this.cleanExpired(key);
-    }
+    const argv = args.slice(numKeys);
 
     // 1. ACQUIRE HOLD
     if (script === ACQUIRE_HOLD_LUA || script.includes('conflictingKeys')) {
@@ -128,8 +122,8 @@ export class InMemoryRedisClient implements IRedisClient {
       const tokenKey = keys[keys.length - 1];
       const holdToken = argv[0];
       const ttl = Number(argv[1]);
-      const seatPayload = argv[2];
-      const tokenPayload = argv[3];
+      const seatPayload = String(argv[2]);
+      const tokenPayload = String(argv[3]);
 
       const conflictingKeys: string[] = [];
       for (let i = 0; i < numSeatKeys; i++) {
@@ -156,7 +150,6 @@ export class InMemoryRedisClient implements IRedisClient {
       for (let i = 0; i < numSeatKeys; i++) {
         this.store.set(keys[i], { value: seatPayload, expiresAt });
       }
-
       this.store.set(tokenKey, { value: tokenPayload, expiresAt });
       return [1, 'OK'];
     }
@@ -193,10 +186,21 @@ export class InMemoryRedisClient implements IRedisClient {
       }
 
       const createdAt = Number(tokenData.createdAt);
-      let newExpiresAt = nowMs + extensionTtl * 1000;
-      if (newExpiresAt - createdAt > maxLifetimeMs) {
-        newExpiresAt = createdAt + maxLifetimeMs;
+      const currentExpiresAt = Number(tokenData.expiresAt) || (createdAt + 600000);
+
+      if (nowMs >= currentExpiresAt) {
+        return [0, 'TOKEN_NOT_FOUND'];
       }
+
+      let newExpiresAt = currentExpiresAt + extensionTtl * 1000;
+      const maxExpiresAt = createdAt + maxLifetimeMs;
+      if (newExpiresAt > maxExpiresAt) {
+        newExpiresAt = maxExpiresAt;
+      }
+      if (newExpiresAt < currentExpiresAt) {
+        newExpiresAt = currentExpiresAt;
+      }
+
       const newTtl = Math.floor((newExpiresAt - nowMs) / 1000);
       if (newTtl <= 0) {
         return [0, 'MAX_LIFETIME_EXCEEDED'];
@@ -269,6 +273,57 @@ export class InMemoryRedisClient implements IRedisClient {
 
       this.store.delete(tokenKey);
       return [1, deletedCount];
+    }
+
+    // 4. RELEASE IDEMPOTENCY LOCK
+    if (
+      script === RELEASE_IDEMPOTENCY_LOCK_LUA ||
+      (script.includes('lockOwnerId') && script.includes('DEL'))
+    ) {
+      const key = keys[0];
+      const lockOwnerId = String(argv[0]);
+      this.cleanExpired(key);
+      const entry = this.store.get(key);
+      if (entry) {
+        try {
+          const data = JSON.parse(entry.value);
+          if (data.lockOwnerId === lockOwnerId && data.status === 'IN_PROGRESS') {
+            this.store.delete(key);
+            return 1;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      return 0;
+    }
+
+    // 5. COMPLETE IDEMPOTENCY
+    if (
+      script === COMPLETE_IDEMPOTENCY_LUA ||
+      (script.includes('lockOwnerId') && script.includes('SET'))
+    ) {
+      const key = keys[0];
+      const lockOwnerId = String(argv[0]);
+      const payload = String(argv[1]);
+      const ttlSeconds = Number(argv[2]);
+      this.cleanExpired(key);
+      const entry = this.store.get(key);
+      if (entry) {
+        try {
+          const data = JSON.parse(entry.value);
+          if (data.lockOwnerId === lockOwnerId && data.status === 'IN_PROGRESS') {
+            this.store.set(key, {
+              value: payload,
+              expiresAt: Date.now() + ttlSeconds * 1000,
+            });
+            return 1;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      return 0;
     }
 
     throw new Error(`Unsupported script evaluated in InMemoryRedisClient`);

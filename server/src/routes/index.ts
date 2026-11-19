@@ -4,6 +4,7 @@ import moviesRouter from './movies.js';
 import cinemasRouter from './cinemas.js';
 import showtimesRouter from './showtimes.js';
 import holdsRouter from './holds.js';
+import bookingsRouter from './bookings.js';
 
 const apiRouter = Router();
 
@@ -17,6 +18,9 @@ apiRouter.use('/showtimes', showtimesRouter);
 
 // Seat reservation & hold endpoints
 apiRouter.use('/holds', holdsRouter);
+
+// Transactional booking endpoints
+apiRouter.use('/bookings', bookingsRouter);
 
 export default apiRouter;
 

@@ -8,6 +8,8 @@
  * - Safe release guarantees only the token holder can release their own held seats.
  * - Safe extension guarantees only the token holder can extend their hold, with strict
  *   extension count and lifetime caps to prevent indefinite holds.
+ * - Correct heartbeat logic: extension adds 300 seconds to the existing expiration window,
+ *   never shortening an active hold, and strictly capped at 900 seconds from creation.
  */
 
 export const ACQUIRE_HOLD_LUA = `
@@ -101,10 +103,22 @@ if currentExtensions >= maxExtensions then
 end
 
 local createdAt = tonumber(tokenData.createdAt)
-local newExpiresAt = nowMs + (extensionTtl * 1000)
-if (newExpiresAt - createdAt) > maxLifetimeMs then
-  newExpiresAt = createdAt + maxLifetimeMs
+local currentExpiresAt = tonumber(tokenData.expiresAt) or (createdAt + 600000)
+
+if nowMs >= currentExpiresAt then
+  return {0, "TOKEN_NOT_FOUND"}
 end
+
+local newExpiresAt = currentExpiresAt + (extensionTtl * 1000)
+local maxExpiresAt = createdAt + maxLifetimeMs
+if newExpiresAt > maxExpiresAt then
+  newExpiresAt = maxExpiresAt
+end
+
+if newExpiresAt < currentExpiresAt then
+  newExpiresAt = currentExpiresAt
+end
+
 local newTtl = math.floor((newExpiresAt - nowMs) / 1000)
 if newTtl <= 0 then
   return {0, "MAX_LIFETIME_EXCEEDED"}
@@ -128,4 +142,35 @@ for i = 1, numSeatKeys do
 end
 
 return {1, newTtl, newExpiresAt, tokenData.extensionCount}
+`;
+
+/**
+ * Atomically releases an in-progress idempotency lock only if the caller owns the lock.
+ * Prevents race condition where a timed-out request's cleanup deletes a newer request's lock.
+ */
+export const RELEASE_IDEMPOTENCY_LOCK_LUA = `
+local val = redis.call('GET', KEYS[1])
+if val then
+  local ok, data = pcall(cjson.decode, val)
+  if ok and data.lockOwnerId == ARGV[1] and data.status == 'IN_PROGRESS' then
+    return redis.call('DEL', KEYS[1])
+  end
+end
+return 0
+`;
+
+/**
+ * Atomically records completed idempotency result only if the worker still holds the lock.
+ * Prevents a stale worker from overwriting a newer request's lock or record.
+ */
+export const COMPLETE_IDEMPOTENCY_LUA = `
+local val = redis.call('GET', KEYS[1])
+if val then
+  local ok, data = pcall(cjson.decode, val)
+  if ok and data.lockOwnerId == ARGV[1] and data.status == 'IN_PROGRESS' then
+    redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+    return 1
+  end
+end
+return 0
 `;
