@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   View,
   StyleSheet,
@@ -23,6 +23,7 @@ import {
   MOCK_NOW_SHOWING_MOVIES,
   MOCK_COMING_SOON_MOVIES,
 } from '@/data/mockMovies';
+import { discoveryApi, IS_LIVE_API_ENABLED } from '@/api/discoveryApi';
 import { colors } from '@/theme/colors';
 import { spacing } from '@/theme/spacing';
 import { radii } from '@/theme/radii';
@@ -30,25 +31,59 @@ import { radii } from '@/theme/radii';
 export default function HomeScreen() {
   const router = useRouter();
   const [selectedGenre, setSelectedGenre] = useState('All');
+  const [nowShowing, setNowShowing] = useState<Movie[]>(MOCK_NOW_SHOWING_MOVIES);
+  const [comingSoon, setComingSoon] = useState<Movie[]>(MOCK_COMING_SOON_MOVIES);
+  const [featuredMovie, setFeaturedMovie] = useState<Movie>(MOCK_FEATURED_MOVIE);
+  const [dataSource, setDataSource] = useState<'live' | 'mock_fallback'>('mock_fallback');
+  const [attribution, setAttribution] = useState<string | undefined>(undefined);
+
+  // Asynchronously query discovery API if feature flag is enabled; safely retain mock baseline on failure
+  useEffect(() => {
+    let isMounted = true;
+    if (IS_LIVE_API_ENABLED) {
+      Promise.all([
+        discoveryApi.getMovies({ category: 'now_showing' }),
+        discoveryApi.getMovies({ category: 'coming_soon' }),
+      ])
+        .then(([nowRes, comingRes]) => {
+          if (!isMounted) return;
+          if (nowRes.data.length > 0) {
+            setNowShowing(nowRes.data);
+            setFeaturedMovie(nowRes.data[0]);
+          }
+          if (comingRes.data.length > 0) {
+            setComingSoon(comingRes.data);
+          }
+          setDataSource(nowRes.source);
+          setAttribution(nowRes.attribution || comingRes.attribution);
+        })
+        .catch(() => {
+          // Retain mock fallback baseline
+        });
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   // Filter movies by active genre chip
   const filteredNowShowing = useMemo(() => {
-    if (selectedGenre === 'All') return MOCK_NOW_SHOWING_MOVIES;
-    return MOCK_NOW_SHOWING_MOVIES.filter(
+    if (selectedGenre === 'All') return nowShowing;
+    return nowShowing.filter(
       (m) =>
         m.genres.includes(selectedGenre) ||
         m.formats.some((f) => f.includes(selectedGenre))
     );
-  }, [selectedGenre]);
+  }, [selectedGenre, nowShowing]);
 
   const filteredComingSoon = useMemo(() => {
-    if (selectedGenre === 'All') return MOCK_COMING_SOON_MOVIES;
-    return MOCK_COMING_SOON_MOVIES.filter(
+    if (selectedGenre === 'All') return comingSoon;
+    return comingSoon.filter(
       (m) =>
         m.genres.includes(selectedGenre) ||
         m.formats.some((f) => f.includes(selectedGenre))
     );
-  }, [selectedGenre]);
+  }, [selectedGenre, comingSoon]);
 
   const handleMovieCardPress = (movie: Movie) => {
     router.push({ pathname: '/movie/[id]', params: { id: movie.id } } as any);
@@ -80,19 +115,26 @@ export default function HomeScreen() {
           </View>
 
           {/* Location Selector Pill (Lagos, Nigeria) */}
-          <TouchableOpacity
-            activeOpacity={0.75}
-            style={styles.locationPill}
-            accessible={true}
-            accessibilityRole="button"
-            accessibilityLabel="Current city: Lagos, Nigeria. Change location"
-          >
-            <Ionicons name="location" size={14} color={colors.highlight} />
-            <Text variant="caption" color="textPrimary" style={styles.locationText}>
-              Lagos, Nigeria
-            </Text>
-            <Ionicons name="chevron-down" size={12} color={colors.textSecondary} />
-          </TouchableOpacity>
+          <View style={styles.topRightControls}>
+            <Badge
+              label={dataSource === 'live' ? 'LIVE' : 'DEMO'}
+              variant={dataSource === 'live' ? 'highlight' : 'outline'}
+              size="sm"
+            />
+            <TouchableOpacity
+              activeOpacity={0.75}
+              style={styles.locationPill}
+              accessible={true}
+              accessibilityRole="button"
+              accessibilityLabel="Current city: Lagos, Nigeria. Change location"
+            >
+              <Ionicons name="location" size={14} color={colors.highlight} />
+              <Text variant="caption" color="textPrimary" style={styles.locationText}>
+                Lagos
+              </Text>
+              <Ionicons name="chevron-down" size={12} color={colors.textSecondary} />
+            </TouchableOpacity>
+          </View>
         </View>
 
         {/* Search Bar Shortcut (Navigates to Search Tab) */}
@@ -199,6 +241,12 @@ export default function HomeScreen() {
             </Text>
           </Card>
         )}
+        {/* TMDB / Metadata Attribution */}
+        {attribution && (
+          <Text variant="caption" color="textMuted" align="center" style={styles.attributionText}>
+            {attribution}
+          </Text>
+        )}
       </ScrollView>
     </ScreenContainer>
   );
@@ -219,6 +267,11 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: spacing.sm,
+  },
+  topRightControls: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
   },
   logoPill: {
     width: 32,
@@ -277,5 +330,11 @@ const styles = StyleSheet.create({
   experienceTitle: {
     fontWeight: '700',
     marginBottom: spacing.xs,
+  },
+  attributionText: {
+    marginTop: spacing.md,
+    paddingHorizontal: spacing.base,
+    fontSize: 10,
+    lineHeight: 14,
   },
 });

@@ -42,6 +42,102 @@ import {
 
 const prisma = new PrismaClient();
 
+export const AUTHORIZED_DEV_ENDPOINT = 'ep-sweet-shadow-bj5hp4ks';
+export const AUTHORIZED_DEV_DATABASE = 'matinee_dev';
+
+export interface SeedValidationResult {
+  allowed: boolean;
+  targetType: 'LOCAL' | 'MATINEE_DEV';
+  error?: string;
+}
+
+/**
+ * Validates the execution environment and target database before running seed.
+ * Guarantees that:
+ * 1. Strict boolean parsing prevents bypasses (e.g. ALLOW_PRODUCTION_SEED="false").
+ * 2. Unrelated systems (Rota, TAIBELL, etc.) are strictly prohibited.
+ * 3. Remote execution is allowed ONLY on the verified Matinee dev project with explicit confirmation.
+ */
+export function validateSeedEnvironment(
+  databaseUrl: string | undefined = process.env.DATABASE_URL,
+  envVars: NodeJS.ProcessEnv = process.env
+): SeedValidationResult {
+  if (!databaseUrl || databaseUrl.trim() === '') {
+    return {
+      allowed: false,
+      targetType: 'LOCAL',
+      error: 'DATABASE_URL environment variable is not defined or is empty.',
+    };
+  }
+
+  // 1. Strict production override parsing: only exact lowercase 'true' is allowed
+  const isProd = envVars.NODE_ENV === 'production';
+  const allowProd = envVars.ALLOW_PRODUCTION_SEED?.trim().toLowerCase() === 'true';
+
+  if (isProd && !allowProd) {
+    return {
+      allowed: false,
+      targetType: 'LOCAL',
+      error:
+        'Refusing to seed in NODE_ENV=production. Strict override ALLOW_PRODUCTION_SEED=true is required.',
+    };
+  }
+
+  // 2. Absolute blacklisting: never touch other systems (Rota, TAIBELL, etc.)
+  const lowerUrl = databaseUrl.toLowerCase();
+  const prohibitedKeywords = ['rota', 'taibell', 'production_db', 'live_prod'];
+  for (const keyword of prohibitedKeywords) {
+    if (lowerUrl.includes(keyword)) {
+      return {
+        allowed: false,
+        targetType: 'LOCAL',
+        error: `DATABASE_URL matches prohibited system keyword '${keyword}'. Aborting seed immediately.`,
+      };
+    }
+  }
+
+  // 3. Check if target is a local development instance
+  const isLocal =
+    lowerUrl.includes('localhost') ||
+    lowerUrl.includes('127.0.0.1') ||
+    lowerUrl.includes('docker.internal');
+
+  if (isLocal) {
+    return {
+      allowed: true,
+      targetType: 'LOCAL',
+    };
+  }
+
+  // 4. Remote database: must match dedicated Matinee development database
+  const matchesDevEndpoint = lowerUrl.includes(AUTHORIZED_DEV_ENDPOINT);
+  const matchesDevDb = lowerUrl.includes(AUTHORIZED_DEV_DATABASE);
+
+  if (!matchesDevEndpoint || !matchesDevDb) {
+    return {
+      allowed: false,
+      targetType: 'MATINEE_DEV',
+      error: `DATABASE_URL points to an unauthorized remote host. Expected endpoint '${AUTHORIZED_DEV_ENDPOINT}' and database '${AUTHORIZED_DEV_DATABASE}'.`,
+    };
+  }
+
+  // 5. Require positive confirmation for remote dev database
+  const isConfirmed = envVars.CONFIRM_MATINEE_DEV_SEED?.trim().toLowerCase() === 'true';
+  if (!isConfirmed) {
+    return {
+      allowed: false,
+      targetType: 'MATINEE_DEV',
+      error:
+        'Positive confirmation required to seed remote development database. Please set CONFIRM_MATINEE_DEV_SEED=true.',
+    };
+  }
+
+  return {
+    allowed: true,
+    targetType: 'MATINEE_DEV',
+  };
+}
+
 // Row labels: 20 letters from Front to Back (skipping I and O)
 const ROW_LETTERS = [
   'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'J', 'K',
@@ -49,6 +145,12 @@ const ROW_LETTERS = [
 ];
 
 async function main() {
+  // Safety Guard: Require positive environment and database verification
+  const validation = validateSeedEnvironment(process.env.DATABASE_URL, process.env);
+  if (!validation.allowed) {
+    throw new Error(`[Matinee Seed Safety Failure] ${validation.error}`);
+  }
+
   console.log('------------------------------------------------------------');
   console.log('[Matinee Seed] Initializing reproducible database seed...');
   console.log('------------------------------------------------------------');
@@ -341,18 +443,39 @@ async function main() {
     });
   }
 
-  // 4. Seed Showtimes for Filmhouse IMAX Screen 1 (Fictional Demonstration Schedule)
+  // 4. Seed Showtimes for Lagos Cinema Venues (Fictional Demonstration Schedule)
   console.log('[Matinee Seed] Upserting Fictional Demonstration Showtimes (synthetic UI fixture; not live listings)...');
-  const baseDate = new Date();
-  baseDate.setHours(14, 30, 0, 0);
+  const now = new Date();
+
+  // Day 0: Today
+  const today1430 = new Date(now);
+  today1430.setHours(14, 30, 0, 0);
+  const today1745 = new Date(now);
+  today1745.setHours(17, 45, 0, 0);
+  const today2030 = new Date(now);
+  today2030.setHours(20, 30, 0, 0);
+
+  // Day 1: Tomorrow
+  const tmrw1430 = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  tmrw1430.setHours(14, 30, 0, 0);
+  const tmrw1800 = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  tmrw1800.setHours(18, 0, 0, 0);
+
+  // Day 2: Day after tomorrow
+  const day21530 = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+  day21530.setHours(15, 30, 0, 0);
+
+  // Day 3: Future Scheduled screening (Demonstrates SCHEDULED, opens soon, not yet bookable)
+  const day31900 = new Date(now.getTime() + 72 * 60 * 60 * 1000);
+  day31900.setHours(19, 0, 0, 0);
 
   const showtimesData = [
     {
       id: 'st-dune-lekki-1430',
       movieId: 'mov-dune-2',
       auditoriumId: 'aud-lekki-imax-01',
-      startTime: new Date(baseDate.getTime()),
-      endTime: new Date(baseDate.getTime() + 166 * 60 * 1000),
+      startTime: today1430,
+      endTime: new Date(today1430.getTime() + 166 * 60 * 1000),
       format: ScreenFormat.IMAX_70MM,
       basePriceKobo: 700000, // Standard: ₦7,000
       vipPriceKobo: 950000, // VIP: ₦9,500
@@ -364,10 +487,101 @@ async function main() {
       id: 'st-dune-lekki-1745',
       movieId: 'mov-dune-2',
       auditoriumId: 'aud-lekki-imax-01',
-      startTime: new Date(baseDate.getTime() + 3.25 * 60 * 60 * 1000),
-      endTime: new Date(baseDate.getTime() + (3.25 * 60 + 166) * 60 * 1000),
+      startTime: today1745,
+      endTime: new Date(today1745.getTime() + 166 * 60 * 1000),
       format: ScreenFormat.IMAX_70MM,
       basePriceKobo: 700000,
+      vipPriceKobo: 950000,
+      couplePairPriceKobo: 1200000,
+      accessiblePriceKobo: 700000,
+      status: ShowtimeStatus.OPEN_FOR_BOOKING,
+    },
+    {
+      id: 'st-interstellar-lekki-2030',
+      movieId: 'mov-interstellar',
+      auditoriumId: 'aud-lekki-imax-01',
+      startTime: today2030,
+      endTime: new Date(today2030.getTime() + 169 * 60 * 1000),
+      format: ScreenFormat.IMAX_70MM,
+      basePriceKobo: 700000,
+      vipPriceKobo: 950000,
+      couplePairPriceKobo: 1200000,
+      accessiblePriceKobo: 700000,
+      status: ShowtimeStatus.OPEN_FOR_BOOKING,
+    },
+    {
+      id: 'st-dune-lekki-tmrw-1430',
+      movieId: 'mov-dune-2',
+      auditoriumId: 'aud-lekki-imax-01',
+      startTime: tmrw1430,
+      endTime: new Date(tmrw1430.getTime() + 166 * 60 * 1000),
+      format: ScreenFormat.IMAX_70MM,
+      basePriceKobo: 700000,
+      vipPriceKobo: 950000,
+      couplePairPriceKobo: 1200000,
+      accessiblePriceKobo: 700000,
+      status: ShowtimeStatus.OPEN_FOR_BOOKING,
+    },
+    {
+      id: 'st-oppenheimer-lekki-tmrw-1800',
+      movieId: 'mov-oppenheimer',
+      auditoriumId: 'aud-lekki-imax-01',
+      startTime: tmrw1800,
+      endTime: new Date(tmrw1800.getTime() + 180 * 60 * 1000),
+      format: ScreenFormat.IMAX_70MM,
+      basePriceKobo: 700000,
+      vipPriceKobo: 950000,
+      couplePairPriceKobo: 1200000,
+      accessiblePriceKobo: 700000,
+      status: ShowtimeStatus.OPEN_FOR_BOOKING,
+    },
+    {
+      id: 'st-dune-lekki-day2-1530',
+      movieId: 'mov-dune-2',
+      auditoriumId: 'aud-lekki-imax-01',
+      startTime: day21530,
+      endTime: new Date(day21530.getTime() + 166 * 60 * 1000),
+      format: ScreenFormat.IMAX_70MM,
+      basePriceKobo: 700000,
+      vipPriceKobo: 950000,
+      couplePairPriceKobo: 1200000,
+      accessiblePriceKobo: 700000,
+      status: ShowtimeStatus.OPEN_FOR_BOOKING,
+    },
+    {
+      id: 'st-dune-lekki-day3-1900',
+      movieId: 'mov-dune-2',
+      auditoriumId: 'aud-lekki-imax-01',
+      startTime: day31900,
+      endTime: new Date(day31900.getTime() + 166 * 60 * 1000),
+      format: ScreenFormat.IMAX_70MM,
+      basePriceKobo: 700000,
+      vipPriceKobo: 950000,
+      couplePairPriceKobo: 1200000,
+      accessiblePriceKobo: 700000,
+      status: ShowtimeStatus.SCHEDULED,
+    },
+    {
+      id: 'st-dune-genesis-1600',
+      movieId: 'mov-dune-2',
+      auditoriumId: 'aud-genesis-palms-01',
+      startTime: tmrw1430,
+      endTime: new Date(tmrw1430.getTime() + 166 * 60 * 1000),
+      format: ScreenFormat.DOLBY_CINEMA,
+      basePriceKobo: 700000,
+      vipPriceKobo: 950000,
+      couplePairPriceKobo: 1200000,
+      accessiblePriceKobo: 700000,
+      status: ShowtimeStatus.OPEN_FOR_BOOKING,
+    },
+    {
+      id: 'st-dune-ebonylife-1830',
+      movieId: 'mov-dune-2',
+      auditoriumId: 'aud-ebonylife-vi-01',
+      startTime: tmrw1800,
+      endTime: new Date(tmrw1800.getTime() + 166 * 60 * 1000),
+      format: ScreenFormat.VIP_RECLINER,
+      basePriceKobo: 950000,
       vipPriceKobo: 950000,
       couplePairPriceKobo: 1200000,
       accessiblePriceKobo: 700000,
@@ -378,7 +592,7 @@ async function main() {
   for (const st of showtimesData) {
     await prisma.showtime.upsert({
       where: { id: st.id },
-      update: st,
+      update: {}, // Invariant: Reruns cannot move or alter existing showtime dates
       create: st,
     });
   }
@@ -402,15 +616,10 @@ async function main() {
   });
 
   // A. Confirmed Booking (Demo fixture matching mockSeats.ts sold seats: E7, E8)
+  // Preserves existing booking state if already seeded
   const confirmedBooking = await prisma.booking.upsert({
     where: { bookingReference: 'DEMO-MAT-8942-X7' },
-    update: {
-      status: BookingStatus.CONFIRMED,
-      seatCount: 2,
-      subtotalKobo: 1400000,
-      bookingFeeKobo: 50000,
-      totalKobo: 1450000,
-    },
+    update: {},
     create: {
       id: 'bkg-demo-confirmed-01',
       bookingReference: 'DEMO-MAT-8942-X7',
@@ -428,10 +637,10 @@ async function main() {
     },
   });
 
-  // Confirmed Tickets for E7 and E8
+  // Confirmed Tickets for E7 and E8 (preserves state on rerun)
   const ticketE7 = await prisma.ticket.upsert({
     where: { ticketCode: 'TKT-DEMO-E7' },
-    update: { status: TicketStatus.CONFIRMED },
+    update: {},
     create: {
       id: 'tkt-demo-e7',
       ticketCode: 'TKT-DEMO-E7',
@@ -447,7 +656,7 @@ async function main() {
 
   const ticketE8 = await prisma.ticket.upsert({
     where: { ticketCode: 'TKT-DEMO-E8' },
-    update: { status: TicketStatus.CONFIRMED },
+    update: {},
     create: {
       id: 'tkt-demo-e8',
       ticketCode: 'TKT-DEMO-E8',
@@ -461,10 +670,10 @@ async function main() {
     },
   });
 
-  // Successful payment attempt for the confirmed booking
+  // Successful payment attempt for the confirmed booking (preserves state on rerun)
   await prisma.paymentAttempt.upsert({
     where: { providerTransactionId: 'TXN-DEMO-SUCC-01' },
-    update: { status: PaymentStatus.SUCCEEDED },
+    update: {},
     create: {
       id: 'pay-demo-succ-01',
       bookingId: confirmedBooking.id,
@@ -480,7 +689,7 @@ async function main() {
   // B. Cancelled Booking demonstrating released seat state
   const cancelledBooking = await prisma.booking.upsert({
     where: { bookingReference: 'DEMO-MAT-CANC-01' },
-    update: { status: BookingStatus.CANCELLED },
+    update: {},
     create: {
       id: 'bkg-demo-cancelled-01',
       bookingReference: 'DEMO-MAT-CANC-01',
@@ -499,7 +708,7 @@ async function main() {
 
   await prisma.ticket.upsert({
     where: { ticketCode: 'TKT-DEMO-CANC-01' },
-    update: { status: TicketStatus.CANCELLED },
+    update: {},
     create: {
       id: 'tkt-demo-canc-01',
       ticketCode: 'TKT-DEMO-CANC-01',
@@ -516,7 +725,7 @@ async function main() {
   // C. Refunded Restricted Booking demonstrating blocked seat state (REFUNDED_RESTRICTED)
   const restrictedBooking = await prisma.booking.upsert({
     where: { bookingReference: 'DEMO-MAT-REFD-01' },
-    update: { status: BookingStatus.REFUNDED },
+    update: {},
     create: {
       id: 'bkg-demo-refunded-01',
       bookingReference: 'DEMO-MAT-REFD-01',
@@ -535,7 +744,7 @@ async function main() {
 
   await prisma.ticket.upsert({
     where: { ticketCode: 'TKT-DEMO-REFD-01' },
-    update: { status: TicketStatus.REFUNDED_RESTRICTED },
+    update: {},
     create: {
       id: 'tkt-demo-refd-01',
       ticketCode: 'TKT-DEMO-REFD-01',
@@ -564,12 +773,14 @@ async function main() {
   console.log('------------------------------------------------------------');
 }
 
-main()
-  .catch((e) => {
-    console.error('[Matinee Seed] Error during seed:', e);
-    process.exit(1);
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
+  main()
+    .catch((e) => {
+      console.error('[Matinee Seed] Error during seed:', e);
+      process.exit(1);
+    })
+    .finally(async () => {
+      await prisma.$disconnect();
+    });
+}
 

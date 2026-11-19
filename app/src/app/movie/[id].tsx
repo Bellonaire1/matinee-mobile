@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   StyleSheet,
@@ -15,9 +15,10 @@ import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { EmptyState } from '@/components/ui/EmptyState';
-import { getMovieById } from '@/data/mockMovies';
+import { Movie, getMovieById } from '@/data/mockMovies';
 import { getCinemasWithShowtimesForMovie } from '@/data/mockCinemas';
 import { APPROVED_MOVIE_STARTING_PRICE } from '@/data/mockSeats';
+import { discoveryApi, IS_LIVE_API_ENABLED } from '@/api/discoveryApi';
 import { colors } from '@/theme/colors';
 import { spacing } from '@/theme/spacing';
 import { radii } from '@/theme/radii';
@@ -30,7 +31,26 @@ export default function MovieDetailsScreen() {
   const [backdropError, setBackdropError] = useState(false);
   const [posterError, setPosterError] = useState(false);
 
-  const movie = id ? getMovieById(id) : undefined;
+  const fallbackMovie = id ? getMovieById(id) : undefined;
+  const [movie, setMovie] = useState<Movie | undefined>(fallbackMovie);
+  const [attribution, setAttribution] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    let isMounted = true;
+    if (id && IS_LIVE_API_ENABLED) {
+      discoveryApi.getMovieById(id).then((res) => {
+        if (!isMounted || !res.data) return;
+        setMovie(res.data);
+        setAttribution(res.attribution);
+      }).catch(() => {
+        // Safe fallback
+      });
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, [id]);
+
   const cinemaAvailability = id ? getCinemasWithShowtimesForMovie(id) : [];
 
   // Graceful fallback for missing movie ID
@@ -339,6 +359,11 @@ export default function MovieDetailsScreen() {
                     : 'No active showtimes currently scheduled for today in Lagos.'}
                 </Text>
               </Card>
+            )}
+            {attribution && (
+              <Text variant="caption" color="textMuted" align="center" style={styles.attributionText}>
+                {attribution}
+              </Text>
             )}
           </View>
         </View>
@@ -655,5 +680,11 @@ const styles = StyleSheet.create({
   },
   bookCTAButton: {
     flex: 1,
+  },
+  attributionText: {
+    marginTop: spacing.lg,
+    fontSize: 10,
+    lineHeight: 14,
+    paddingHorizontal: spacing.base,
   },
 });

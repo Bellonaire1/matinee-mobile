@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   View,
   StyleSheet,
@@ -23,6 +23,7 @@ import {
   MOCK_NARRATIVE_GENRES,
   MOCK_TECHNICAL_FORMATS,
 } from '@/data/discoveryEngine';
+import { discoveryApi, IS_LIVE_API_ENABLED } from '@/api/discoveryApi';
 import { colors } from '@/theme/colors';
 import { spacing } from '@/theme/spacing';
 import { radii } from '@/theme/radii';
@@ -32,15 +33,32 @@ export default function SearchScreen() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedGenre, setSelectedGenre] = useState<string>('All');
   const [selectedFormat, setSelectedFormat] = useState<string>('All Formats');
+  const [moviesPool, setMoviesPool] = useState<Movie[]>(ALL_MOVIES);
+
+  // Seamlessly integrate live discovery catalog when feature flag is enabled
+  useEffect(() => {
+    let isMounted = true;
+    if (IS_LIVE_API_ENABLED) {
+      discoveryApi.getMovies().then((res) => {
+        if (!isMounted || !res.data || res.data.length === 0) return;
+        setMoviesPool(res.data);
+      }).catch(() => {
+        // Fallback baseline
+      });
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   // Filter movies purely from catalog
   const filteredMovies = useMemo(() => {
-    return filterMovies(ALL_MOVIES, {
+    return filterMovies(moviesPool, {
       query: searchQuery,
       genre: selectedGenre,
       format: selectedFormat,
     });
-  }, [searchQuery, selectedGenre, selectedFormat]);
+  }, [moviesPool, searchQuery, selectedGenre, selectedFormat]);
 
   const summaryText = useMemo(() => {
     return getSearchSummaryText(
