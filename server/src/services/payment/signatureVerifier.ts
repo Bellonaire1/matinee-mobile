@@ -20,7 +20,7 @@ export interface PaystackV2SignatureParts {
  * Also supports optional keyId omission: "t=1700000000,v1=sig1"
  */
 export function parsePaystackV2Header(headerValue: string): PaystackV2SignatureParts {
-  if (!headerValue || typeof headerValue !== 'string') {
+  if (!headerValue || typeof headerValue !== 'string' || !headerValue.trim()) {
     throw new AppError(
       'Paystack-Signature header is missing or empty',
       401,
@@ -34,11 +34,24 @@ export function parsePaystackV2Header(headerValue: string): PaystackV2SignatureP
 
   for (const part of parts) {
     const eqIdx = part.indexOf('=');
-    if (eqIdx === -1) continue;
+    if (eqIdx === -1) {
+      throw new AppError(
+        'Paystack-Signature header contains malformed parameter',
+        401,
+        'INVALID_WEBHOOK_SIGNATURE'
+      );
+    }
     const key = part.slice(0, eqIdx).trim();
     const val = part.slice(eqIdx + 1).trim();
 
     if (key === 't') {
+      if (timestamp !== null) {
+        throw new AppError(
+          'Paystack-Signature header contains duplicate timestamp parameter (t=)',
+          401,
+          'INVALID_WEBHOOK_SIGNATURE'
+        );
+      }
       if (!/^\d+$/.test(val)) {
         throw new AppError(
           'Paystack-Signature header contains non-numeric timestamp',
@@ -56,7 +69,13 @@ export function parsePaystackV2Header(headerValue: string): PaystackV2SignatureP
       }
       timestamp = parsed;
     } else if (key === 'v1') {
-      if (!val) continue;
+      if (!val) {
+        throw new AppError(
+          'Paystack-Signature header contains empty v1 signature',
+          401,
+          'INVALID_WEBHOOK_SIGNATURE'
+        );
+      }
       const colonIdx = val.indexOf(':');
       if (colonIdx !== -1) {
         const keyId = val.slice(0, colonIdx).trim();
@@ -105,6 +124,15 @@ export function verifyPaystackV2Signature(
   secrets: string | string[],
   currentTimestampSeconds: number = Math.floor(Date.now() / 1000)
 ): { valid: boolean; reason?: string } {
+  if (
+    rawBody === undefined ||
+    rawBody === null ||
+    (Buffer.isBuffer(rawBody) && rawBody.length === 0) ||
+    (typeof rawBody === 'string' && rawBody.length === 0)
+  ) {
+    return { valid: false, reason: 'RAW_BODY_MISSING' };
+  }
+
   if (!headerValue || !headerValue.trim()) {
     return { valid: false, reason: 'EMPTY_HEADER' };
   }
@@ -179,6 +207,15 @@ export function verifyLegacyPaystackSignature(
   headerValue: string,
   secretKey: string
 ): { valid: boolean; reason?: string } {
+  if (
+    rawBody === undefined ||
+    rawBody === null ||
+    (Buffer.isBuffer(rawBody) && rawBody.length === 0) ||
+    (typeof rawBody === 'string' && rawBody.length === 0)
+  ) {
+    return { valid: false, reason: 'RAW_BODY_MISSING' };
+  }
+
   if (!headerValue || !headerValue.trim() || !secretKey || !secretKey.trim()) {
     return { valid: false, reason: 'MISSING_PARAMETERS' };
   }
@@ -235,8 +272,31 @@ export function verifyIncomingWebhookSignature(
 ): { scheme: 'v2' | 'legacy'; verified: boolean } {
   const { paystackSignature, legacySignature } = headers;
 
+  if (
+    rawBody === undefined ||
+    rawBody === null ||
+    (Buffer.isBuffer(rawBody) && rawBody.length === 0) ||
+    (typeof rawBody === 'string' && rawBody.length === 0)
+  ) {
+    throw new AppError(
+      'Exact raw request body bytes are required for webhook signature verification',
+      400,
+      'RAW_BODY_MISSING'
+    );
+  }
+
   // 1. Preferred modern format (Paystack-Signature)
-  if (paystackSignature && paystackSignature.trim()) {
+  // If modern signature parameter was supplied at all (even if empty or invalid),
+  // evaluate it strictly. NEVER fall back to legacy if modern parameter was provided!
+  if (paystackSignature !== undefined) {
+    if (!paystackSignature || !paystackSignature.trim()) {
+      throw new AppError(
+        'Paystack-Signature verification failed (EMPTY_HEADER)',
+        401,
+        'INVALID_WEBHOOK_SIGNATURE'
+      );
+    }
+
     const result = verifyPaystackV2Signature(
       rawBody,
       paystackSignature,
@@ -257,7 +317,15 @@ export function verifyIncomingWebhookSignature(
   }
 
   // 2. Legacy fallback format (x-paystack-signature) - ONLY when modern header is absent
-  if (legacySignature && legacySignature.trim()) {
+  if (legacySignature !== undefined) {
+    if (!legacySignature || !legacySignature.trim()) {
+      throw new AppError(
+        'Legacy webhook signature verification failed (MISSING_PARAMETERS)',
+        401,
+        'INVALID_WEBHOOK_SIGNATURE'
+      );
+    }
+
     if (!options.legacySecretKey || !options.legacySecretKey.trim()) {
       throw new AppError(
         'Legacy Paystack webhook signature verification is not configured',

@@ -62,9 +62,32 @@ export async function handleWebhook(
   next: NextFunction
 ): Promise<void> {
   try {
+    if (!paymentService.isPaymentEnabled()) {
+      res.status(503).json({
+        status: 'error',
+        code: 'PAYMENT_DISABLED',
+        message: 'Payment processing is currently disabled',
+      });
+      return;
+    }
+
+    const rawBody = (req as any).rawBody;
+    if (
+      rawBody === undefined ||
+      rawBody === null ||
+      (Buffer.isBuffer(rawBody) && rawBody.length === 0) ||
+      (typeof rawBody === 'string' && rawBody.length === 0)
+    ) {
+      res.status(400).json({
+        status: 'error',
+        code: 'RAW_BODY_MISSING',
+        message: 'Exact raw request body bytes are required for webhook signature verification',
+      });
+      return;
+    }
+
     const paystackSignature = req.header('paystack-signature');
     const legacySignature = req.header('x-paystack-signature');
-    const rawBody = (req as any).rawBody ?? JSON.stringify(req.body);
 
     const result = await paymentService.processWebhook(rawBody, {
       paystackSignature,

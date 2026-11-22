@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   StyleSheet,
@@ -14,6 +14,7 @@ import { Text } from '@/components/ui/Text';
 import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
+import { Input } from '@/components/ui/Input';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { generateAuditoriumLayout, APPROVED_BASE_PRICE_KOBO } from '@/data/mockSeats';
 import { formatSeatCount } from '@/data/seatSelectionEngine';
@@ -24,6 +25,16 @@ import {
   DEMO_CHECKOUT_STATES,
   DemoCheckoutState,
 } from '@/data/checkoutEngine';
+import {
+  simulatedCheckoutEngine,
+  HeldSeatItem,
+  HoldResult,
+  BookingResult,
+  PaymentStatusResult,
+  INITIAL_HOLD_SECONDS,
+  MAX_HOLD_LIFETIME_SECONDS,
+  MAX_ALLOWED_EXTENSIONS,
+} from '@/api/checkoutApi';
 import { colors } from '@/theme/colors';
 import { spacing } from '@/theme/spacing';
 import { radii } from '@/theme/radii';
@@ -38,8 +49,35 @@ export default function CheckoutPreviewScreen() {
     seatIds?: string;
   }>();
 
-  // Active demonstration modal state
+  // Active demonstration modal state (static demos)
   const [activeDemoState, setActiveDemoState] = useState<DemoCheckoutState>('none');
+
+  // Contact info form state
+  const [customerEmail, setCustomerEmail] = useState('test.customer@example.com');
+  const [customerName, setCustomerName] = useState('Adaeze Okafor');
+  const [emailError, setEmailError] = useState<string | undefined>(undefined);
+
+  // Active hold simulation state
+  const [holdResult, setHoldResult] = useState<HoldResult | null>(null);
+  const [secondsRemaining, setSecondsRemaining] = useState<number>(INITIAL_HOLD_SECONDS);
+  const [extensionCount, setExtensionCount] = useState<number>(0);
+  const [holdExpired, setHoldExpired] = useState<boolean>(false);
+  const [holdStatusMessage, setHoldStatusMessage] = useState<string | null>(null);
+
+  // Transactional simulation execution state
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const [simulationResult, setSimulationResult] = useState<{
+    outcome: 'succeeded' | 'failed' | 'expired';
+    booking?: BookingResult;
+    payment?: PaymentStatusResult;
+    failureReason?: string;
+  } | null>(null);
+  const [showResultModal, setShowResultModal] = useState<boolean>(false);
+
+  // Stable session idempotency key across retries
+  const idempotencyKeyRef = useRef<string>(
+    `sim_idemp_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`
+  );
 
   // Derive auditorium domain model with approved tier base pricing
   const auditorium = useMemo(() => {
@@ -54,6 +92,189 @@ export default function CheckoutPreviewScreen() {
       auditorium.hallName
     );
   }, [params, auditorium]);
+
+  // Transform selected seats to held items matching the backend contract
+  const heldSeats = useMemo<HeldSeatItem[]>(() => {
+    if (!validationResult.isValid) return [];
+    return validationResult.selectionTotals.selectedSeats.map((seat) => ({
+      id: seat.id,
+      seatNumber: seat.displayLabel,
+      row: seat.row,
+      column: seat.col,
+      tier: seat.tier,
+      priceKobo: seat.priceKobo,
+    }));
+  }, [validationResult]);
+
+  // Acquire simulated hold on mount
+  useEffect(() => {
+    if (!validationResult.isValid) return;
+
+    let isMounted = true;
+    const showtimeId = validationResult.showtime.id;
+    const seatIds = validationResult.selectionTotals.selectedSeats.map((s) => s.id);
+    const totalPriceKobo = validationResult.selectionTotals.totalKobo;
+
+    simulatedCheckoutEngine
+      .acquireHold(showtimeId, seatIds, heldSeats, totalPriceKobo)
+      .then((hold) => {
+        if (!isMounted) return;
+        setHoldResult(hold);
+        setSecondsRemaining(hold.expiresInSeconds);
+        setExtensionCount(hold.extensionCount);
+        setHoldExpired(false);
+      })
+      .catch((err) => {
+        if (!isMounted) return;
+        console.warn('Failed to acquire initial simulated hold:', err);
+      });
+
+    return () => {
+      isMounted = false;
+      // Release simulated hold on unmount / navigation away
+      if (holdResult?.holdToken) {
+        simulatedCheckoutEngine.releaseHold(holdResult.holdToken).catch(() => {});
+      }
+    };
+  }, [validationResult.isValid]);
+
+  // Hold countdown timer tick
+  useEffect(() => {
+    if (holdExpired || !holdResult) return;
+
+    const interval = setInterval(() => {
+      setSecondsRemaining((prev) => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          setHoldExpired(true);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [holdExpired, holdResult]);
+
+  // Hold extension handler (+5 Mins)
+  const handleExtendHold = useCallback(async () => {
+    if (!holdResult || holdExpired || extensionCount >= MAX_ALLOWED_EXTENSIONS) return;
+
+    try {
+      const res = await simulatedCheckoutEngine.extendHold(holdResult.holdToken);
+      setSecondsRemaining(res.expiresInSeconds);
+      setExtensionCount(res.extensionCount);
+      setHoldStatusMessage(res.message);
+      setTimeout(() => setHoldStatusMessage(null), 4000);
+    } catch (err: any) {
+      setHoldStatusMessage(err?.message || 'Could not extend hold');
+      setTimeout(() => setHoldStatusMessage(null), 4000);
+    }
+  }, [holdResult, holdExpired, extensionCount]);
+
+  // Clean back navigation releasing hold
+  const handleBack = useCallback(() => {
+    if (holdResult?.holdToken) {
+      simulatedCheckoutEngine.releaseHold(holdResult.holdToken).catch(() => {});
+    }
+    router.back();
+  }, [holdResult, router]);
+
+  // Interactive Simulated Checkout Flow
+  const handleExecuteSimulatedCheckout = useCallback(
+    async (outcome: 'succeeded' | 'failed' = 'succeeded') => {
+      if (!validationResult.isValid) return;
+
+      // Validate customer email
+      if (!customerEmail.trim() || !customerEmail.includes('@')) {
+        setEmailError('Please enter a valid customer email address.');
+        return;
+      }
+      setEmailError(undefined);
+
+      if (holdExpired) {
+        setSimulationResult({
+          outcome: 'expired',
+          failureReason: 'Seat hold has expired. Please select seats again.',
+        });
+        setShowResultModal(true);
+        return;
+      }
+
+      setIsProcessing(true);
+
+      try {
+        const showtimeId = validationResult.showtime.id;
+        const seatIds = validationResult.selectionTotals.selectedSeats.map((s) => s.id);
+        const totalPriceKobo = validationResult.selectionTotals.totalKobo;
+        const holdToken = holdResult?.holdToken || 'sim_hold_default';
+
+        // Step 1: Create transactional pending booking (preserving idempotencyKey)
+        const booking = await simulatedCheckoutEngine.createBooking({
+          showtimeId,
+          seatIds,
+          contactEmail: customerEmail.trim(),
+          contactName: customerName.trim() || undefined,
+          totalPriceKobo,
+          holdToken,
+          idempotencyKey: idempotencyKeyRef.current,
+        });
+
+        // Step 2: Initialize test payment
+        const paymentInit = await simulatedCheckoutEngine.initializePayment({
+          bookingId: booking.id,
+          email: customerEmail.trim(),
+          holdToken,
+        });
+
+        // Step 3: Simulate payment settlement inquiry
+        const paymentStatus = await simulatedCheckoutEngine.getPaymentStatus({
+          reference: paymentInit.reference,
+          outcome,
+        });
+
+        if (outcome === 'succeeded') {
+          setSimulationResult({
+            outcome: 'succeeded',
+            booking,
+            payment: paymentStatus,
+          });
+        } else {
+          setSimulationResult({
+            outcome: 'failed',
+            booking,
+            payment: paymentStatus,
+            failureReason: 'Simulated payment failed (card declined)',
+          });
+        }
+        setShowResultModal(true);
+      } catch (err: any) {
+        const msg = err?.message || 'Simulated checkout encountered an unexpected issue';
+        if (msg.includes('expired')) {
+          setHoldExpired(true);
+          setSimulationResult({
+            outcome: 'expired',
+            failureReason: 'Seat hold has expired. Please select seats again.',
+          });
+        } else {
+          setSimulationResult({
+            outcome: 'failed',
+            failureReason: msg,
+          });
+        }
+        setShowResultModal(true);
+      } finally {
+        setIsProcessing(false);
+      }
+    },
+    [
+      validationResult,
+      customerEmail,
+      customerName,
+      holdExpired,
+      holdResult,
+    ]
+  );
 
   // Graceful Handling for Invalid or Missing Selection Parameters
   if (!validationResult.isValid) {
@@ -102,6 +323,13 @@ export default function CheckoutPreviewScreen() {
   const demoStateMeta =
     activeDemoState !== 'none' ? DEMO_CHECKOUT_STATES[activeDemoState] : null;
 
+  // Format MM:SS for countdown timer
+  const formatTimer = (seconds: number) => {
+    const mins = Math.floor(Math.max(0, seconds) / 60);
+    const secs = Math.max(0, seconds) % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
   return (
     <View style={styles.container}>
       <Stack.Screen options={{ headerShown: false }} />
@@ -110,7 +338,7 @@ export default function CheckoutPreviewScreen() {
       <SafeAreaView edges={['top']} style={styles.topHeader}>
         <TouchableOpacity
           activeOpacity={0.8}
-          onPress={() => router.back()}
+          onPress={handleBack}
           accessible={true}
           accessibilityRole="button"
           accessibilityLabel="Go back to seat selection"
@@ -121,14 +349,14 @@ export default function CheckoutPreviewScreen() {
 
         <View style={styles.headerInfoCol}>
           <Text variant="heading2" color="textPrimary" numberOfLines={1}>
-            Checkout Preview
+            Checkout (Demo)
           </Text>
           <Text variant="caption" color="textSecondary" numberOfLines={1}>
-            Demo &bull; Non-Transactional Simulation
+            Offline Simulation &bull; Test Checkout
           </Text>
         </View>
 
-        <Badge label="DEMO" variant="highlight" size="sm" />
+        <Badge label="TEST MODE" variant="highlight" size="sm" />
       </SafeAreaView>
 
       {/* Prominent Demo Disclaimer Banner */}
@@ -138,10 +366,10 @@ export default function CheckoutPreviewScreen() {
         </View>
         <View style={styles.bannerTextBox}>
           <Text variant="caption" color="textPrimary" style={styles.bannerTitle}>
-            {CHECKOUT_DEMO_DISCLAIMER}
+            TEST / DEMO MODE — NO REAL PAYMENT REQUIRED
           </Text>
           <Text variant="caption" color="textSecondary" style={styles.bannerSubtext}>
-            {CHECKOUT_DEMO_SUBTEXT}
+            {CHECKOUT_DEMO_SUBTEXT} Card transactions and tickets are simulated locally. No real money or live reservation records will be modified.
           </Text>
         </View>
       </View>
@@ -150,11 +378,93 @@ export default function CheckoutPreviewScreen() {
       <ScrollView
         contentContainerStyle={[
           styles.scrollContent,
-          { paddingBottom: insets.bottom + 120 },
+          { paddingBottom: insets.bottom + 140 },
         ]}
         showsVerticalScrollIndicator={false}
       >
-        {/* Booking Summary Card */}
+        {/* Active Hold Countdown Banner Card */}
+        <Card
+          variant="surface"
+          padding="base"
+          style={[
+            styles.holdTimerCard,
+            holdExpired && styles.holdTimerCardExpired,
+          ]}
+        >
+          <View style={styles.holdTimerRow}>
+            <View style={styles.holdTimerLeftCol}>
+              <View style={styles.timerHeaderRow}>
+                <Ionicons
+                  name={holdExpired ? 'alert-circle' : 'time-outline'}
+                  size={20}
+                  color={holdExpired ? '#F44336' : colors.highlight}
+                />
+                <Text
+                  variant="supporting"
+                  color={holdExpired ? 'textPrimary' : 'textPrimary'}
+                  style={styles.holdTimerLabel}
+                >
+                  {holdExpired ? 'Seat Hold Expired' : 'Temporary Seat Hold'}
+                </Text>
+                {extensionCount > 0 && !holdExpired && (
+                  <Badge label="Extended +5m" variant="highlight" size="sm" />
+                )}
+              </View>
+
+              <Text
+                variant="heading1"
+                color={holdExpired ? 'textSecondary' : 'textPrimary'}
+                style={[styles.timerDigits, holdExpired && styles.timerDigitsExpired]}
+              >
+                {formatTimer(secondsRemaining)}
+              </Text>
+
+              <Text variant="caption" color="textSecondary">
+                {holdExpired
+                  ? 'Seat hold has expired. Please select seats again.'
+                  : `10m hold (${INITIAL_HOLD_SECONDS}s). Extend once up to ${MAX_HOLD_LIFETIME_SECONDS}s max.`}
+              </Text>
+            </View>
+
+            {/* +5 Mins Heartbeat Extension Button */}
+            {!holdExpired && (
+              <View style={styles.holdTimerActions}>
+                <Button
+                  title={extensionCount >= MAX_ALLOWED_EXTENSIONS ? 'Extended' : '+5 Mins'}
+                  variant="secondary"
+                  size="sm"
+                  disabled={extensionCount >= MAX_ALLOWED_EXTENSIONS || isProcessing}
+                  onPress={handleExtendHold}
+                  accessible={true}
+                  accessibilityRole="button"
+                  accessibilityLabel="Extend seat hold by 5 minutes"
+                />
+              </View>
+            )}
+          </View>
+
+          {holdStatusMessage && (
+            <View style={styles.holdStatusAlert}>
+              <Ionicons name="information-circle-outline" size={14} color={colors.highlight} />
+              <Text variant="caption" color="textPrimary" style={styles.holdStatusText}>
+                {holdStatusMessage}
+              </Text>
+            </View>
+          )}
+
+          {holdExpired && (
+            <View style={styles.expiredRecoveryBox}>
+              <Button
+                title="Select Seats Again"
+                variant="primary"
+                size="sm"
+                onPress={handleBack}
+              />
+            </View>
+          )}
+        </Card>
+
+        {/* Film & Showtime Summary Card */}
         <Card variant="surface" padding="base" style={styles.sectionCard}>
           <View style={styles.cardHeaderRow}>
             <Ionicons name="film-outline" size={18} color={colors.primary} />
@@ -251,12 +561,50 @@ export default function CheckoutPreviewScreen() {
           </View>
         </Card>
 
+        {/* Customer Information (Inputs) */}
+        <Card variant="surface" padding="base" style={styles.sectionCard}>
+          <View style={styles.cardHeaderRow}>
+            <Ionicons name="person-outline" size={18} color={colors.primary} />
+            <Text variant="heading2" color="textPrimary" style={styles.cardTitle}>
+              Customer Details (Test Session)
+            </Text>
+          </View>
+
+          <Text variant="caption" color="textSecondary" style={styles.inputSectionSubtext}>
+            Enter simulated customer details for order receipt confirmation:
+          </Text>
+
+          <Input
+            label="Customer Email"
+            value={customerEmail}
+            onChangeText={(text) => {
+              setCustomerEmail(text);
+              if (emailError) setEmailError(undefined);
+            }}
+            placeholder="e.g. adaeze@example.com"
+            keyboardType="email-address"
+            autoCapitalize="none"
+            error={emailError}
+            iconLeft={<Ionicons name="mail-outline" size={18} color={colors.textSecondary} />}
+          />
+
+          <Input
+            label="Customer Full Name (Optional)"
+            value={customerName}
+            onChangeText={setCustomerName}
+            placeholder="e.g. Adaeze Okafor"
+            autoCapitalize="words"
+            iconLeft={<Ionicons name="person-outline" size={18} color={colors.textSecondary} />}
+            containerStyle={styles.nameInputContainer}
+          />
+        </Card>
+
         {/* Itemized Price Breakdown */}
         <Card variant="surface" padding="base" style={styles.sectionCard}>
           <View style={styles.cardHeaderRow}>
             <Ionicons name="receipt-outline" size={18} color={colors.primary} />
             <Text variant="heading2" color="textPrimary" style={styles.cardTitle}>
-              Estimated Price Breakdown
+              Price Breakdown (Simulated NGN)
             </Text>
           </View>
 
@@ -302,20 +650,66 @@ export default function CheckoutPreviewScreen() {
           </View>
         </Card>
 
-        {/* Demonstration States Playground */}
-        <Card variant="elevated" padding="base" style={styles.demoPlaygroundCard}>
+        {/* Interactive Simulation Actions Card */}
+        <Card variant="elevated" padding="base" style={styles.simulationCard}>
           <View style={styles.cardHeaderRow}>
-            <Ionicons name="flask-outline" size={18} color={colors.highlight} />
+            <Ionicons name="play-circle-outline" size={20} color={colors.highlight} />
             <Text variant="heading2" color="textPrimary" style={styles.cardTitle}>
-              Simulate UI Demonstration States
+              Simulate Test Checkout Outcomes
             </Text>
           </View>
           <Text variant="caption" color="textSecondary" style={styles.demoSectionNote}>
-            Explore how Matinee renders asynchronous checkout outcomes without charging real money or altering auditorium holds:
+            Test the live mobile checkout engine without charging real money or altering live database tables:
+          </Text>
+
+          <View style={styles.simActionsStack}>
+            {/* 1. Simulate Test Payment (Success) */}
+            <Button
+              title={isProcessing ? 'Processing Test Payment...' : `Simulate Test Payment (${formattedTotal})`}
+              variant="primary"
+              size="lg"
+              disabled={isProcessing || holdExpired}
+              onPress={() => handleExecuteSimulatedCheckout('succeeded')}
+              iconRight={
+                isProcessing ? (
+                  <ActivityIndicator size="small" color={colors.background} />
+                ) : (
+                  <Ionicons name="shield-checkmark-outline" size={18} color={colors.background} />
+                )
+              }
+              accessible={true}
+              accessibilityRole="button"
+              accessibilityLabel="Execute simulated test payment"
+            />
+
+            {/* 2. Simulate Card Decline (Failure & Retry) */}
+            <Button
+              title="Simulate Card Authorization Decline"
+              variant="secondary"
+              size="md"
+              disabled={isProcessing || holdExpired}
+              onPress={() => handleExecuteSimulatedCheckout('failed')}
+              iconRight={<Ionicons name="card-outline" size={16} color={colors.textPrimary} />}
+              accessible={true}
+              accessibilityRole="button"
+              accessibilityLabel="Simulate card decline and retry experience"
+            />
+          </View>
+        </Card>
+
+        {/* Demonstration States Static Explorer */}
+        <Card variant="surface" padding="base" style={styles.demoPlaygroundCard}>
+          <View style={styles.cardHeaderRow}>
+            <Ionicons name="flask-outline" size={18} color={colors.highlight} />
+            <Text variant="heading2" color="textPrimary" style={styles.cardTitle}>
+              Static UI State Gallery
+            </Text>
+          </View>
+          <Text variant="caption" color="textSecondary" style={styles.demoSectionNote}>
+            Preview individual UI screen mockups:
           </Text>
 
           <View style={styles.demoButtonsStack}>
-            {/* 1. Pending Verification Demo */}
             <TouchableOpacity
               activeOpacity={0.8}
               onPress={() => setActiveDemoState('pending')}
@@ -330,7 +724,7 @@ export default function CheckoutPreviewScreen() {
               <View style={styles.demoTileTextBox}>
                 <View style={styles.demoTileHeader}>
                   <Text variant="supporting" color="textPrimary" style={styles.demoTileTitle}>
-                    1. Payment Verification Pending
+                    1. Verification Pending
                   </Text>
                   <Badge label="Pending" variant="highlight" size="sm" />
                 </View>
@@ -340,7 +734,6 @@ export default function CheckoutPreviewScreen() {
               </View>
             </TouchableOpacity>
 
-            {/* 2. Payment Failed Demo */}
             <TouchableOpacity
               activeOpacity={0.8}
               onPress={() => setActiveDemoState('failed')}
@@ -355,7 +748,7 @@ export default function CheckoutPreviewScreen() {
               <View style={styles.demoTileTextBox}>
                 <View style={styles.demoTileHeader}>
                   <Text variant="supporting" color="textPrimary" style={styles.demoTileTitle}>
-                    2. Payment Authorization Failed
+                    2. Authorization Failed
                   </Text>
                   <Badge label="Declined" variant="status" size="sm" />
                 </View>
@@ -365,7 +758,6 @@ export default function CheckoutPreviewScreen() {
               </View>
             </TouchableOpacity>
 
-            {/* 3. Seat Selection Expired Demo */}
             <TouchableOpacity
               activeOpacity={0.8}
               onPress={() => setActiveDemoState('expired')}
@@ -380,7 +772,7 @@ export default function CheckoutPreviewScreen() {
               <View style={styles.demoTileTextBox}>
                 <View style={styles.demoTileHeader}>
                   <Text variant="supporting" color="textPrimary" style={styles.demoTileTitle}>
-                    3. Seat Selection Expired
+                    3. Selection Expired
                   </Text>
                   <Badge label="Timeout" variant="outline" size="sm" />
                 </View>
@@ -406,19 +798,228 @@ export default function CheckoutPreviewScreen() {
           </View>
 
           <Button
-            title="Explore Demo States"
+            title={isProcessing ? 'Processing...' : holdExpired ? 'Hold Expired' : 'Simulate Payment'}
             variant="primary"
             size="md"
-            iconRight={<Ionicons name="sparkles-outline" size={16} color={colors.background} />}
-            onPress={() => setActiveDemoState('pending')}
+            disabled={isProcessing || holdExpired}
+            iconRight={
+              isProcessing ? (
+                <ActivityIndicator size="small" color={colors.background} />
+              ) : (
+                <Ionicons name="card-outline" size={16} color={colors.background} />
+              )
+            }
+            onPress={() => handleExecuteSimulatedCheckout('succeeded')}
             accessible={true}
             accessibilityRole="button"
-            accessibilityLabel="Explore demo payment verification states"
+            accessibilityLabel="Simulate test payment"
           />
         </View>
       </View>
 
-      {/* Full Modal for Demonstration States */}
+      {/* Outcome Modal (Interactive Test Checkout Results) */}
+      {showResultModal && simulationResult && (
+        <Modal
+          visible={showResultModal}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setShowResultModal(false)}
+        >
+          <View style={styles.modalBackdrop}>
+            <Card variant="surface" padding="base" style={styles.modalCard}>
+              {/* Outcome Badge */}
+              <View style={styles.modalBadgeRow}>
+                <Badge
+                  label={
+                    simulationResult.outcome === 'succeeded'
+                      ? 'SIMULATED SUCCESS'
+                      : simulationResult.outcome === 'failed'
+                      ? 'SIMULATED DECLINE'
+                      : 'HOLD EXPIRED'
+                  }
+                  variant={
+                    simulationResult.outcome === 'succeeded'
+                      ? 'highlight'
+                      : simulationResult.outcome === 'failed'
+                      ? 'status'
+                      : 'outline'
+                  }
+                  size="sm"
+                />
+              </View>
+
+              {/* Outcome Icon Box */}
+              <View
+                style={[
+                  styles.modalIconBox,
+                  {
+                    borderColor:
+                      simulationResult.outcome === 'succeeded'
+                        ? '#4CAF50'
+                        : simulationResult.outcome === 'failed'
+                        ? '#F44336'
+                        : colors.highlight,
+                  },
+                ]}
+              >
+                <Ionicons
+                  name={
+                    simulationResult.outcome === 'succeeded'
+                      ? 'checkmark-circle'
+                      : simulationResult.outcome === 'failed'
+                      ? 'alert-circle'
+                      : 'time-outline'
+                  }
+                  size={42}
+                  color={
+                    simulationResult.outcome === 'succeeded'
+                      ? '#4CAF50'
+                      : simulationResult.outcome === 'failed'
+                      ? '#F44336'
+                      : colors.highlight
+                  }
+                />
+              </View>
+
+              {/* Title & Subtitle */}
+              <Text variant="heading1" color="textPrimary" align="center" style={styles.modalTitle}>
+                {simulationResult.outcome === 'succeeded'
+                  ? 'Simulated payment successful'
+                  : simulationResult.outcome === 'failed'
+                  ? 'Simulated payment failed (card declined)'
+                  : 'Seat hold has expired'}
+              </Text>
+              <Text variant="body" color="textSecondary" align="center" style={styles.modalSubtitle}>
+                {simulationResult.outcome === 'succeeded'
+                  ? 'Your test order was processed in offline simulation mode. No live credit card was charged.'
+                  : simulationResult.outcome === 'failed'
+                  ? 'Simulated issuing bank declined the card authorization. You can retry with your preserved hold.'
+                  : 'Seat hold has expired. Please select seats again.'}
+              </Text>
+
+              {/* Details Box */}
+              <View style={styles.modalContextBox}>
+                {simulationResult.booking && (
+                  <View style={styles.contextLine}>
+                    <Text variant="caption" color="textSecondary">
+                      Booking Reference:
+                    </Text>
+                    <Text variant="caption" color="textPrimary" style={styles.contextValueBold}>
+                      {simulationResult.booking.bookingReference}
+                    </Text>
+                  </View>
+                )}
+
+                <View style={styles.contextLine}>
+                  <Text variant="caption" color="textSecondary">
+                    Selected Seats:
+                  </Text>
+                  <Text variant="caption" color="textPrimary" style={styles.contextValueBold}>
+                    {selectionTotals.seatLabels}
+                  </Text>
+                </View>
+
+                <View style={styles.contextLine}>
+                  <Text variant="caption" color="textSecondary">
+                    Simulated Amount:
+                  </Text>
+                  <Text variant="caption" color="primary" style={styles.contextValueBold}>
+                    {formattedTotal}
+                  </Text>
+                </View>
+
+                {simulationResult.outcome === 'failed' && (
+                  <View style={styles.contextLine}>
+                    <Text variant="caption" color="textSecondary">
+                      Preserved Session:
+                    </Text>
+                    <Text variant="caption" color="textPrimary" style={styles.contextValueBold}>
+                      {idempotencyKeyRef.current.substring(0, 16)}...
+                    </Text>
+                  </View>
+                )}
+              </View>
+
+              {/* Notice / Honesty Box */}
+              <View style={styles.modalExplanationBox}>
+                <Ionicons name="information-circle-outline" size={16} color={colors.highlight} />
+                <Text variant="caption" color="textSecondary" style={styles.modalExplanationText}>
+                  {simulationResult.outcome === 'succeeded'
+                    ? 'NOTICE: Offline simulation only. No live database ticket or live QR code was created.'
+                    : simulationResult.outcome === 'failed'
+                    ? 'Idempotency key retained. Retrying will not allocate duplicate tickets.'
+                    : 'Holds release automatically upon timeout to free inventory for other moviegoers.'}
+                </Text>
+              </View>
+
+              {/* Actions */}
+              <View style={styles.modalActionsCol}>
+                {simulationResult.outcome === 'succeeded' && (
+                  <>
+                    <Button
+                      title="Explore More Movies"
+                      variant="primary"
+                      size="md"
+                      onPress={() => {
+                        setShowResultModal(false);
+                        router.replace('/');
+                      }}
+                      style={styles.modalFullBtn}
+                    />
+                    <Button
+                      title="View Order Summary"
+                      variant="outline"
+                      size="md"
+                      onPress={() => setShowResultModal(false)}
+                      style={styles.modalFullBtn}
+                    />
+                  </>
+                )}
+
+                {simulationResult.outcome === 'failed' && (
+                  <>
+                    <Button
+                      title="Retry Test Payment"
+                      variant="primary"
+                      size="md"
+                      onPress={() => {
+                        setShowResultModal(false);
+                        handleExecuteSimulatedCheckout('succeeded');
+                      }}
+                      style={styles.modalFullBtn}
+                    />
+                    <Button
+                      title="Cancel &amp; Return"
+                      variant="outline"
+                      size="md"
+                      onPress={() => {
+                        setShowResultModal(false);
+                        handleBack();
+                      }}
+                      style={styles.modalFullBtn}
+                    />
+                  </>
+                )}
+
+                {simulationResult.outcome === 'expired' && (
+                  <Button
+                    title="Select Seats Again"
+                    variant="primary"
+                    size="md"
+                    onPress={() => {
+                      setShowResultModal(false);
+                      handleBack();
+                    }}
+                    style={styles.modalFullBtn}
+                  />
+                )}
+              </View>
+            </Card>
+          </View>
+        </Modal>
+      )}
+
+      {/* Full Modal for Static Demonstration States */}
       {demoStateMeta && (
         <Modal
           visible={activeDemoState !== 'none'}
@@ -428,12 +1029,10 @@ export default function CheckoutPreviewScreen() {
         >
           <View style={styles.modalBackdrop}>
             <Card variant="surface" padding="base" style={styles.modalCard}>
-              {/* Demo Badge */}
               <View style={styles.modalBadgeRow}>
                 <Badge label={demoStateMeta.badgeLabel} variant="highlight" size="sm" />
               </View>
 
-              {/* State Icon */}
               <View style={[styles.modalIconBox, { borderColor: demoStateMeta.iconColor }]}>
                 {activeDemoState === 'pending' ? (
                   <ActivityIndicator size="large" color={demoStateMeta.iconColor} />
@@ -446,7 +1045,6 @@ export default function CheckoutPreviewScreen() {
                 )}
               </View>
 
-              {/* State Title & Description */}
               <Text variant="heading1" color="textPrimary" align="center" style={styles.modalTitle}>
                 {demoStateMeta.title}
               </Text>
@@ -454,7 +1052,6 @@ export default function CheckoutPreviewScreen() {
                 {demoStateMeta.description}
               </Text>
 
-              {/* Simulated Transaction Info Box */}
               <View style={styles.modalContextBox}>
                 <View style={styles.contextLine}>
                   <Text variant="caption" color="textSecondary">
@@ -484,7 +1081,6 @@ export default function CheckoutPreviewScreen() {
                 </View>
               </View>
 
-              {/* Technical / Architecture Explanation */}
               <View style={styles.modalExplanationBox}>
                 <Ionicons name="information-circle-outline" size={16} color={colors.highlight} />
                 <Text variant="caption" color="textSecondary" style={styles.modalExplanationText}>
@@ -492,7 +1088,6 @@ export default function CheckoutPreviewScreen() {
                 </Text>
               </View>
 
-              {/* State Action Buttons */}
               <View style={styles.modalActionsCol}>
                 {activeDemoState === 'pending' && (
                   <Button
@@ -528,7 +1123,7 @@ export default function CheckoutPreviewScreen() {
                 )}
 
                 <Button
-                  title={activeDemoState === 'expired' ? 'Return to Showtimes' : 'Return to Checkout Preview'}
+                  title={activeDemoState === 'expired' ? 'Return to Showtimes' : 'Return to Checkout'}
                   variant="outline"
                   size="md"
                   onPress={() => {
@@ -606,6 +1201,60 @@ const styles = StyleSheet.create({
     padding: spacing.base,
     gap: spacing.base,
   },
+  holdTimerCard: {
+    borderWidth: 1,
+    borderColor: 'rgba(246, 190, 99, 0.35)',
+    backgroundColor: 'rgba(246, 190, 99, 0.04)',
+    gap: spacing.xs,
+  },
+  holdTimerCardExpired: {
+    borderColor: 'rgba(244, 67, 54, 0.4)',
+    backgroundColor: 'rgba(244, 67, 54, 0.05)',
+  },
+  holdTimerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  holdTimerLeftCol: {
+    flex: 1,
+    gap: 2,
+  },
+  timerHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+  },
+  holdTimerLabel: {
+    fontWeight: '700',
+  },
+  timerDigits: {
+    fontSize: 28,
+    fontWeight: '800',
+    color: colors.highlight,
+    letterSpacing: 1,
+  },
+  timerDigitsExpired: {
+    color: '#F44336',
+  },
+  holdTimerActions: {
+    marginLeft: spacing.sm,
+  },
+  holdStatusAlert: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    paddingTop: spacing.xs,
+    borderTopWidth: 1,
+    borderColor: colors.border,
+  },
+  holdStatusText: {
+    fontSize: 11,
+    color: colors.highlight,
+  },
+  expiredRecoveryBox: {
+    paddingTop: spacing.xs,
+  },
   sectionCard: {
     gap: spacing.sm,
   },
@@ -665,6 +1314,12 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderColor: colors.border,
   },
+  inputSectionSubtext: {
+    marginBottom: spacing.xs,
+  },
+  nameInputContainer: {
+    marginTop: spacing.xs,
+  },
   receiptLineRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -693,6 +1348,16 @@ const styles = StyleSheet.create({
   },
   totalAmount: {
     fontWeight: '800',
+  },
+  simulationCard: {
+    gap: spacing.sm,
+    borderWidth: 1,
+    borderColor: 'rgba(183, 138, 247, 0.35)',
+    backgroundColor: 'rgba(183, 138, 247, 0.04)',
+  },
+  simActionsStack: {
+    gap: spacing.sm,
+    marginTop: spacing.xs,
   },
   demoPlaygroundCard: {
     gap: spacing.sm,
@@ -830,4 +1495,3 @@ const styles = StyleSheet.create({
     width: '100%',
   },
 });
-

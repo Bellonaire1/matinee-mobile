@@ -74,7 +74,9 @@ export class PaymentService {
 
   constructor(options?: PaymentServiceOptions) {
     this.prisma = options?.prisma || defaultPrisma;
-    this.enabled = options?.enabled ?? (process.env.PAYMENT_ENABLED === 'true');
+    const envVal = process.env.PAYMENT_ENABLED;
+    const isEnvTrue = envVal === 'true' || envVal === '1';
+    this.enabled = options?.enabled ?? isEnvTrue;
 
     const rawSecrets =
       options?.webhookSecret ||
@@ -93,6 +95,32 @@ export class PaymentService {
       new PaystackTestAdapter({
         secretKey: this.legacySecretKey,
       });
+
+    if (this.enabled) {
+      if (
+        process.env.NODE_ENV === 'production' &&
+        (this.provider.providerName === PaymentProvider.PAYSTACK_TEST ||
+          (this.provider.providerName as any) === 'TEST_GATEWAY' ||
+          process.env.PAYMENT_PROVIDER === 'TEST_GATEWAY' ||
+          process.env.PAYMENT_PROVIDER === 'PAYSTACK_TEST')
+      ) {
+        throw new AppError(
+          'Test payment provider cannot be enabled in production environment',
+          500,
+          'INVALID_PAYMENT_PROVIDER'
+        );
+      }
+      if (
+        this.legacySecretKey === 'test_sk_placeholder' ||
+        this.webhookSecrets.includes('test_whsec_placeholder')
+      ) {
+        throw new AppError(
+          'Placeholder signing secrets cannot authorize payment processing',
+          500,
+          'INSECURE_PAYMENT_CONFIG'
+        );
+      }
+    }
   }
 
   isPaymentEnabled(): boolean {
@@ -316,6 +344,10 @@ export class PaymentService {
     signatureHeaders?: VerifyIncomingHeaders | string,
     nowSeconds?: number
   ): Promise<{ status: string; message: string; bookingId?: string }> {
+    if (!this.enabled) {
+      throw new AppError('Payment processing is currently disabled', 503, 'PAYMENT_DISABLED');
+    }
+
     const headers: VerifyIncomingHeaders =
       typeof signatureHeaders === 'string'
         ? { paystackSignature: signatureHeaders }
@@ -449,14 +481,22 @@ export class PaymentService {
       const bookingId = paymentAttempt.bookingId;
 
       // 2. ACQUIRE SHARED ROW LOCK ON THE SAME BOOKING ROW
-      if (typeof (tx as any).$queryRaw === 'function') {
-        try {
-          await (tx as any).$queryRaw`
-            SELECT id, status, expires_at FROM bookings WHERE id = ${bookingId}::uuid FOR UPDATE;
-          `;
-        } catch {
-          // Fallback gracefully in mock test environments
-        }
+      // Parameterized PostgreSQL SELECT ... FOR UPDATE. Aborts entire transaction if locking fails.
+      let lockedRows: any[];
+      try {
+        lockedRows = await (tx as any).$queryRaw`
+          SELECT id, status, expires_at FROM bookings WHERE id = ${bookingId}::uuid FOR UPDATE;
+        `;
+      } catch (lockErr: any) {
+        throw new AppError(
+          `Row lock acquisition failed for booking '${bookingId}': ${lockErr?.message || 'database lock error'}`,
+          500,
+          'ROW_LOCK_FAILED'
+        );
+      }
+
+      if (!lockedRows || lockedRows.length === 0) {
+        throw new AppError('Associated booking record not found under row lock', 404, 'BOOKING_NOT_FOUND');
       }
 
       // 3. Re-read fresh booking row under strict row lock
@@ -541,7 +581,13 @@ export class PaymentService {
 
       // 6. Double-check provider verification via stub/adapter
       const verification = await this.provider.verifyPayment(reference);
-      if (!verification.success || verification.amountKobo !== freshBooking.totalKobo) {
+      if (
+        !verification.success ||
+        verification.status !== 'success' ||
+        verification.amountKobo !== freshBooking.totalKobo ||
+        (verification.currency && verification.currency.toUpperCase() !== 'NGN') ||
+        (verification.reference && verification.reference !== reference)
+      ) {
         await tx.paymentAttempt.update({
           where: { id: paymentAttempt.id },
           data: {
@@ -557,7 +603,7 @@ export class PaymentService {
             provider: this.provider.providerName,
             eventType: 'charge.success',
             status: WebhookProcessingStatus.FAILED,
-            error: 'Provider transaction verification check failed',
+            error: `Provider transaction verification check failed: status=${verification.status}, amount=${verification.amountKobo}`,
           },
         });
 

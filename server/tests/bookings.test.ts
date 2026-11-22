@@ -1066,6 +1066,7 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
 
       vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
         const tx = {
+          $queryRaw: vi.fn().mockResolvedValue([{ id: 'bk-expired-a', status: BookingStatus.PENDING }]),
           booking: {
             findUnique: vi.fn().mockResolvedValue({
               id: 'bk-expired-a',
@@ -1103,6 +1104,7 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
 
       vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
         const tx = {
+          $queryRaw: vi.fn().mockResolvedValue([{ id: 'bk-confirmed-b', status: BookingStatus.CONFIRMED }]),
           booking: {
             findUnique: vi.fn().mockResolvedValue({
               id: 'bk-confirmed-b',
@@ -1134,6 +1136,7 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
       // Worker 2 runs: updateMany returns count: 0 because Worker 1 already flipped status to EXPIRED
       vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
         const tx = {
+          $queryRaw: vi.fn().mockResolvedValue([{ id: 'bk-competing-c', status: BookingStatus.PENDING }]),
           booking: {
             findUnique: vi.fn().mockResolvedValue({
               id: 'bk-competing-c',
@@ -1166,6 +1169,7 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
       // In-transaction re-check sees a paymentAttempt in PROCESSING
       vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
         const tx = {
+          $queryRaw: vi.fn().mockResolvedValue([{ id: 'bk-settling-d', status: BookingStatus.PENDING }]),
           booking: {
             findUnique: vi.fn().mockResolvedValue({
               id: 'bk-settling-d',
@@ -1197,6 +1201,7 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
 
       vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
         const tx = {
+          $queryRaw: vi.fn().mockResolvedValue([{ id: 'bk-paid-e', status: BookingStatus.PENDING }]),
           booking: {
             findUnique: vi.fn().mockResolvedValue({
               id: 'bk-paid-e',
@@ -1244,6 +1249,7 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
           throw new Error('PostgreSQL deadlock / transaction serialization error');
         }
         const tx = {
+          $queryRaw: vi.fn().mockResolvedValue([{ id: 'bk-healthy-2', status: BookingStatus.PENDING }]),
           booking: {
             findUnique: vi.fn().mockResolvedValue({
               id: 'bk-healthy-2',
@@ -1267,6 +1273,33 @@ describe('Matinee Transactional Booking Foundation (POST /api/v1/bookings)', () 
         expect.stringContaining('bk-deadlock-1')
       );
       consoleWarnSpy.mockRestore();
+    });
+
+    it('Scenario H: Failed SELECT FOR UPDATE row locking aborts transaction immediately without mutating state', async () => {
+      const now = new Date();
+      vi.spyOn(prisma.booking, 'findMany').mockResolvedValue([{ id: 'bk-lock-fail-1' }] as any);
+
+      const updateBookingsMock = vi.fn();
+      const updateTicketsMock = vi.fn();
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        const tx = {
+          $queryRaw: vi.fn().mockRejectedValue(new Error('canceling statement due to lock timeout')),
+          booking: {
+            findUnique: vi.fn(),
+            updateMany: updateBookingsMock,
+          },
+          ticket: {
+            updateMany: updateTicketsMock,
+          },
+        };
+        return cb(tx);
+      });
+
+      const count = await bookingService.expireAbandonedBookings(now);
+      expect(count).toBe(0);
+      expect(updateBookingsMock).not.toHaveBeenCalled();
+      expect(updateTicketsMock).not.toHaveBeenCalled();
     });
   });
 });

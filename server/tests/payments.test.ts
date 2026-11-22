@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { app } from '../src/app.js';
 import { testRequest } from './helpers/testRequest.js';
 import { prisma } from '../src/db.js';
+import { envSchema, parseEnv } from '../src/config/env.js';
 import {
   BookingStatus,
   PaymentProvider,
@@ -15,6 +16,7 @@ import {
   verifyIncomingWebhookSignature,
   verifyPaystackV2Signature,
   verifyLegacyPaystackSignature,
+  parsePaystackV2Header,
   generateTransactionReference,
 } from '../src/services/payment/index.js';
 import { PaystackTestAdapter } from '../src/services/payment/paystackTestAdapter.js';
@@ -338,6 +340,12 @@ describe('Matinee Payment Lifecycle & Safe Settlement (Milestone M05.6A-FINAL)',
   describe('Phase 2: Truthful Payment and Refund States', () => {
     it('accurately records late payment arriving after expiration as PaymentAttempt.SUCCEEDED with refundRequired=true', async () => {
       const adapter = new PaystackTestAdapter({ secretKey: TEST_PAYSTACK_KEY });
+      adapter.setVerificationStub(mockPaymentAttempt.providerTransactionId, {
+        status: 'success',
+        amountKobo: 700000,
+        currency: 'NGN',
+        reference: mockPaymentAttempt.providerTransactionId,
+      });
       const service = new PaymentService({
         prisma: prisma as any,
         provider: adapter,
@@ -401,6 +409,12 @@ describe('Matinee Payment Lifecycle & Safe Settlement (Milestone M05.6A-FINAL)',
 
     it('deduplicates repeated late-success notifications without altering state or refund flags', async () => {
       const adapter = new PaystackTestAdapter({ secretKey: TEST_PAYSTACK_KEY });
+      adapter.setVerificationStub(mockPaymentAttempt.providerTransactionId, {
+        status: 'success',
+        amountKobo: 700000,
+        currency: 'NGN',
+        reference: mockPaymentAttempt.providerTransactionId,
+      });
       const service = new PaymentService({
         prisma: prisma as any,
         provider: adapter,
@@ -567,6 +581,12 @@ describe('Matinee Payment Lifecycle & Safe Settlement (Milestone M05.6A-FINAL)',
   describe('Phase 4: Webhook Deduplication and Recovery', () => {
     it('rolls back completely if a database error occurs during settlement, allowing subsequent retry', async () => {
       const adapter = new PaystackTestAdapter({ secretKey: TEST_PAYSTACK_KEY });
+      adapter.setVerificationStub(mockPaymentAttempt.providerTransactionId, {
+        status: 'success',
+        amountKobo: 700000,
+        currency: 'NGN',
+        reference: mockPaymentAttempt.providerTransactionId,
+      });
       const service = new PaymentService({
         prisma: prisma as any,
         provider: adapter,
@@ -646,6 +666,12 @@ describe('Matinee Payment Lifecycle & Safe Settlement (Milestone M05.6A-FINAL)',
   describe('Scenarios J & K: Shared Locking Settlement vs Expiration', () => {
     it('Settlement wins: confirms booking and causes reconciler to safely skip it', async () => {
       const adapter = new PaystackTestAdapter({ secretKey: TEST_PAYSTACK_KEY });
+      adapter.setVerificationStub(mockPaymentAttempt.providerTransactionId, {
+        status: 'success',
+        amountKobo: 700000,
+        currency: 'NGN',
+        reference: mockPaymentAttempt.providerTransactionId,
+      });
       const service = new PaymentService({
         prisma: prisma as any,
         provider: adapter,
@@ -705,6 +731,12 @@ describe('Matinee Payment Lifecycle & Safe Settlement (Milestone M05.6A-FINAL)',
 
     it('Two concurrent settlement workers resolve idempotently: exactly one settles to CONFIRMED', async () => {
       const adapter = new PaystackTestAdapter({ secretKey: TEST_PAYSTACK_KEY });
+      adapter.setVerificationStub(mockPaymentAttempt.providerTransactionId, {
+        status: 'success',
+        amountKobo: 700000,
+        currency: 'NGN',
+        reference: mockPaymentAttempt.providerTransactionId,
+      });
       const service = new PaymentService({
         prisma: prisma as any,
         provider: adapter,
@@ -745,6 +777,430 @@ describe('Matinee Payment Lifecycle & Safe Settlement (Milestone M05.6A-FINAL)',
       expect(res2.settled).toBe(true);
       expect(res2.bookingStatus).toBe(BookingStatus.CONFIRMED);
       expect(res2.message).toMatch(/already confirmed/i);
+    });
+  });
+
+  // =========================================================================
+  describe('Phase 6: Payment Disabled Mode & Environment Invariants (Milestone M05.6C)', () => {
+    it('missing PAYMENT_ENABLED env var parses strictly as false', () => {
+      const parsed = envSchema.parse({
+        NODE_ENV: 'test',
+        DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/matinee_db?schema=public',
+      });
+      expect(parsed.PAYMENT_ENABLED).toBe(false);
+    });
+
+    it('literal string "false" in PAYMENT_ENABLED parses as false (strict boolean parsing prevents truthy coercion)', () => {
+      const parsed = envSchema.parse({
+        NODE_ENV: 'test',
+        PAYMENT_ENABLED: 'false',
+        DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/matinee_db?schema=public',
+      });
+      expect(parsed.PAYMENT_ENABLED).toBe(false);
+    });
+
+    it('literal string "0" in PAYMENT_ENABLED parses as false', () => {
+      const parsed = envSchema.parse({
+        NODE_ENV: 'test',
+        PAYMENT_ENABLED: '0',
+        DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/matinee_db?schema=public',
+      });
+      expect(parsed.PAYMENT_ENABLED).toBe(false);
+    });
+
+    it('PAYMENT_ENABLED=true with placeholder secret key fails schema validation', () => {
+      const result = envSchema.safeParse({
+        NODE_ENV: 'test',
+        PAYMENT_ENABLED: 'true',
+        PAYMENT_TEST_SECRET_KEY: 'test_sk_placeholder',
+        PAYMENT_WEBHOOK_SECRET: 'valid_webhook_secret_123',
+        DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/matinee_db?schema=public',
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues.some((i) => i.path.includes('PAYMENT_TEST_SECRET_KEY'))).toBe(true);
+      }
+    });
+
+    it('PAYMENT_ENABLED=true with placeholder webhook secret fails schema validation', () => {
+      const result = envSchema.safeParse({
+        NODE_ENV: 'test',
+        PAYMENT_ENABLED: 'true',
+        PAYMENT_TEST_SECRET_KEY: 'sk_test_valid_key_123',
+        PAYMENT_WEBHOOK_SECRET: 'test_whsec_placeholder',
+        DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/matinee_db?schema=public',
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues.some((i) => i.path.includes('PAYMENT_WEBHOOK_SECRET'))).toBe(true);
+      }
+    });
+
+    it('production + TEST_GATEWAY rejects in envSchema', () => {
+      const result = envSchema.safeParse({
+        NODE_ENV: 'production',
+        PAYMENT_ENABLED: 'true',
+        PAYMENT_PROVIDER: 'TEST_GATEWAY',
+        PAYMENT_TEST_SECRET_KEY: 'sk_test_valid_key_123',
+        PAYMENT_WEBHOOK_SECRET: 'whsec_valid_secret_123',
+        DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/matinee_db?schema=public',
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues.some((i) => i.path.includes('PAYMENT_PROVIDER'))).toBe(true);
+      }
+    });
+
+    it('production + PAYSTACK_TEST rejects in envSchema', () => {
+      const result = envSchema.safeParse({
+        NODE_ENV: 'production',
+        PAYMENT_ENABLED: 'true',
+        PAYMENT_PROVIDER: 'PAYSTACK_TEST',
+        PAYMENT_TEST_SECRET_KEY: 'sk_test_valid_key_123',
+        PAYMENT_WEBHOOK_SECRET: 'whsec_valid_secret_123',
+        DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/matinee_db?schema=public',
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues.some((i) => i.path.includes('PAYMENT_PROVIDER'))).toBe(true);
+      }
+    });
+
+    it('attempting to enable test adapter in production environment throws error', () => {
+      const origEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = 'production';
+      try {
+        expect(() => {
+          new PaystackTestAdapter({ secretKey: 'sk_test_valid_test_key_123' });
+        }).toThrow(/not permitted in production/i);
+      } finally {
+        process.env.NODE_ENV = origEnv;
+      }
+    });
+
+    it('PaymentService rejects both TEST_GATEWAY and PAYSTACK_TEST in production when enabled', () => {
+      const origEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = 'production';
+      try {
+        expect(() => {
+          new PaymentService({
+            enabled: true,
+            legacySecretKey: 'sk_test_valid_test_key_123',
+            webhookSecret: 'whsec_valid_secret_123',
+          });
+        }).toThrow(/not permitted in production|cannot be enabled in production/i);
+      } finally {
+        process.env.NODE_ENV = origEnv;
+      }
+    });
+
+    it('payment reference alone is strictly unauthorized for status inquiry without capability token', async () => {
+      vi.spyOn(prisma.paymentAttempt, 'findUnique').mockResolvedValue(mockPaymentAttempt as any);
+      const res = await testRequest(app, {
+        method: 'GET',
+        url: `/api/v1/payments/status/${mockPaymentAttempt.providerTransactionId}`,
+        // NO X-Hold-Token and NO Authorization header provided
+      });
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe('UNAUTHORIZED_PAYMENT_ACCESS');
+    });
+
+    it('POST /api/v1/payments/webhook returns 503 PAYMENT_DISABLED when payments are disabled', async () => {
+      const payload = {
+        event: 'charge.success',
+        data: {
+          id: 99991,
+          reference: 'MAT-PAY-DISABLED-1',
+          amount: 700000,
+          currency: 'NGN',
+          status: 'success',
+        },
+      };
+      const { rawBody, headerValue } = signPaystackV2(payload);
+
+      const res = await testRequest(app, {
+        method: 'POST',
+        url: '/api/v1/payments/webhook',
+        headers: {
+          'Content-Type': 'application/json',
+          'Paystack-Signature': headerValue,
+        },
+        body: payload,
+      });
+
+      expect(res.status).toBe(503);
+      expect(res.body.code).toBe('PAYMENT_DISABLED');
+    });
+
+    it('webhook received while payments disabled performs zero database mutations', async () => {
+      const findUniqueSpy = vi.spyOn(prisma.processedWebhookEvent, 'findUnique');
+      const createSpy = vi.spyOn(prisma.processedWebhookEvent, 'create');
+      const transactionSpy = vi.spyOn(prisma, '$transaction');
+
+      const payload = {
+        event: 'charge.success',
+        data: {
+          id: 99992,
+          reference: 'MAT-PAY-DISABLED-2',
+          amount: 700000,
+          currency: 'NGN',
+          status: 'success',
+        },
+      };
+      const { rawBody, headerValue } = signPaystackV2(payload);
+
+      await testRequest(app, {
+        method: 'POST',
+        url: '/api/v1/payments/webhook',
+        headers: {
+          'Content-Type': 'application/json',
+          'Paystack-Signature': headerValue,
+        },
+        body: payload,
+      });
+
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(transactionSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  // =========================================================================
+  describe('Phase 7: Fail-Closed Provider Verification (Milestone M05.6C)', () => {
+    it('unknown, unstubbed references fail verification immediately with success: false', async () => {
+      const adapter = new PaystackTestAdapter({ secretKey: TEST_PAYSTACK_KEY });
+      const verification = await adapter.verifyPayment('UNKNOWN-UNSTUBBED-REFERENCE-XYZ');
+
+      expect(verification.success).toBe(false);
+      expect(verification.status).toBe('failed');
+      expect(verification.amountKobo).toBe(0);
+      expect(verification.gatewayResponse).toContain('Unknown transaction reference');
+    });
+
+    it('verifyPayment strictly checks verified transaction reference, amount, currency and status', async () => {
+      const adapter = new PaystackTestAdapter({ secretKey: TEST_PAYSTACK_KEY });
+      adapter.setVerificationStub('REF-FIXTURE-SUCCESS', {
+        status: 'success',
+        amountKobo: 1400000,
+        currency: 'NGN',
+        reference: 'REF-FIXTURE-SUCCESS',
+      });
+
+      const verification = await adapter.verifyPayment('REF-FIXTURE-SUCCESS');
+      expect(verification.success).toBe(true);
+      expect(verification.status).toBe('success');
+      expect(verification.amountKobo).toBe(1400000);
+      expect(verification.currency).toBe('NGN');
+      expect(verification.reference).toBe('REF-FIXTURE-SUCCESS');
+    });
+
+    it('settleBookingPayment rejects confirmation and sets status=FAILED when provider verification fails', async () => {
+      const adapter = new PaystackTestAdapter({ secretKey: TEST_PAYSTACK_KEY });
+      // Do NOT stub the reference; it will return failure from verifyPayment!
+      const service = new PaymentService({
+        prisma: prisma as any,
+        provider: adapter,
+        webhookSecret: TEST_WHSEC,
+        enabled: true,
+      });
+
+      let updatedStatus: PaymentStatus | null = null;
+      vi.spyOn(prisma.processedWebhookEvent, 'findUnique').mockResolvedValue(null);
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        const tx = createMockTx();
+        tx.paymentAttempt.update = vi.fn().mockImplementation((args: any) => {
+          updatedStatus = args.data.status;
+          return { ...mockPaymentAttempt, ...args.data };
+        });
+        return cb(tx);
+      });
+
+      const result = await service.settleBookingPayment({
+        reference: mockPaymentAttempt.providerTransactionId,
+        amountKobo: 700000,
+        currency: 'NGN',
+        providerStatus: 'success',
+        eventId: 'evt-fail-closed-verif',
+      });
+
+      expect(result.settled).toBe(false);
+      expect(result.paymentStatus).toBe(PaymentStatus.FAILED);
+      expect(updatedStatus).toBe(PaymentStatus.FAILED);
+      expect(result.message).toMatch(/provider verification failed/i);
+    });
+
+    it('mismatched verification amount or currency rejects settlement', async () => {
+      const adapter = new PaystackTestAdapter({ secretKey: TEST_PAYSTACK_KEY });
+      adapter.setVerificationStub(mockPaymentAttempt.providerTransactionId, {
+        status: 'success',
+        amountKobo: 500000, // Mismatched: expected 700000
+        currency: 'NGN',
+        reference: mockPaymentAttempt.providerTransactionId,
+      });
+
+      const service = new PaymentService({
+        prisma: prisma as any,
+        provider: adapter,
+        webhookSecret: TEST_WHSEC,
+        enabled: true,
+      });
+
+      vi.spyOn(prisma.processedWebhookEvent, 'findUnique').mockResolvedValue(null);
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        const tx = createMockTx();
+        return cb(tx);
+      });
+
+      const result = await service.settleBookingPayment({
+        reference: mockPaymentAttempt.providerTransactionId,
+        amountKobo: 700000,
+        currency: 'NGN',
+        providerStatus: 'success',
+        eventId: 'evt-mismatch-verif',
+      });
+
+      expect(result.settled).toBe(false);
+      expect(result.paymentStatus).toBe(PaymentStatus.FAILED);
+    });
+  });
+
+  // =========================================================================
+  describe('Phase 8: Fail-Closed PostgreSQL Row Locking (Milestone M05.6C)', () => {
+    it('failed SELECT FOR UPDATE statement timeout/error aborts transaction immediately and preserves existing state', async () => {
+      const adapter = new PaystackTestAdapter({ secretKey: TEST_PAYSTACK_KEY });
+      const service = new PaymentService({
+        prisma: prisma as any,
+        provider: adapter,
+        webhookSecret: TEST_WHSEC,
+        enabled: true,
+      });
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        const tx = {
+          paymentAttempt: {
+            findUnique: vi.fn().mockResolvedValue(mockPaymentAttempt),
+          },
+          $queryRaw: vi.fn().mockRejectedValue(new Error('statement timeout while acquiring row lock on bookings')),
+          booking: {
+            findUnique: vi.fn(),
+            update: vi.fn(),
+          },
+        };
+        return cb(tx);
+      });
+
+      await expect(
+        service.settleBookingPayment({
+          reference: mockPaymentAttempt.providerTransactionId,
+          amountKobo: 700000,
+          currency: 'NGN',
+          providerStatus: 'success',
+          eventId: 'evt-lock-fail',
+        })
+      ).rejects.toThrow(/Row lock acquisition failed/i);
+    });
+
+    it('row lock error triggers rollback and leaves booking PENDING and tickets PENDING_PAYMENT', async () => {
+      const adapter = new PaystackTestAdapter({ secretKey: TEST_PAYSTACK_KEY });
+      const service = new PaymentService({
+        prisma: prisma as any,
+        provider: adapter,
+        webhookSecret: TEST_WHSEC,
+        enabled: true,
+      });
+
+      const updateBookingSpy = vi.fn();
+      const updateTicketSpy = vi.fn();
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        const tx = {
+          paymentAttempt: {
+            findUnique: vi.fn().mockResolvedValue(mockPaymentAttempt),
+          },
+          $queryRaw: vi.fn().mockRejectedValue(new Error('deadlock detected')),
+          booking: {
+            findUnique: vi.fn(),
+            update: updateBookingSpy,
+          },
+          ticket: {
+            updateMany: updateTicketSpy,
+          },
+        };
+        return cb(tx);
+      });
+
+      await expect(
+        service.settleBookingPayment({
+          reference: mockPaymentAttempt.providerTransactionId,
+          amountKobo: 700000,
+          currency: 'NGN',
+          providerStatus: 'success',
+          eventId: 'evt-deadlock-test',
+        })
+      ).rejects.toThrow();
+
+      expect(updateBookingSpy).not.toHaveBeenCalled();
+      expect(updateTicketSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  // =========================================================================
+  describe('Phase 9: Webhook Raw Body & Signature Precedence (Milestone M05.6C)', () => {
+    it('rejects missing or empty rawBody with 400 RAW_BODY_MISSING', async () => {
+      const service = new PaymentService({
+        prisma: prisma as any,
+        webhookSecret: TEST_WHSEC,
+        enabled: true,
+      });
+
+      await expect(
+        service.processWebhook('', { paystackSignature: 't=123,v1=abc' })
+      ).rejects.toThrow(/Exact raw request body bytes are required/i);
+    });
+
+    it('rejects one-byte request body tampering in modern Paystack-Signature format', () => {
+      const payload = { event: 'charge.success', data: { reference: 'REF-TAMPER-1' } };
+      const { rawBody, headerValue } = signPaystackV2(payload);
+
+      // Tamper exactly 1 byte
+      const tamperedBody = rawBody.replace('REF-TAMPER-1', 'REF-TAMPER-2');
+      const result = verifyPaystackV2Signature(tamperedBody, headerValue, TEST_WHSEC);
+
+      expect(result.valid).toBe(false);
+      expect(result.reason).toBe('SIGNATURE_MISMATCH');
+    });
+
+    it('rejects duplicate timestamp parameter (t=) in Paystack-Signature header', () => {
+      const duplicateTimestampHeader = 't=1700000000,t=1700000001,v1=some_signature_hex';
+
+      // 1. Direct parser rejects with descriptive message
+      expect(() => {
+        parsePaystackV2Header(duplicateTimestampHeader);
+      }).toThrow(/duplicate timestamp parameter/i);
+
+      // 2. Incoming verification rejects with 401
+      expect(() => {
+        verifyIncomingWebhookSignature(
+          JSON.stringify({ event: 'charge.success' }),
+          { paystackSignature: duplicateTimestampHeader },
+          { webhookSecrets: TEST_WHSEC }
+        );
+      }).toThrow(/Paystack-Signature verification failed/i);
+    });
+
+    it('empty modern Paystack-Signature header does NOT fall back to legacy, rejects with 401', () => {
+      const payload = { event: 'charge.success' };
+      const { rawBody, signature: legacySig } = signLegacy(payload);
+
+      expect(() => {
+        verifyIncomingWebhookSignature(
+          rawBody,
+          {
+            paystackSignature: '   ', // Empty modern header supplied
+            legacySignature: legacySig, // Valid legacy signature also present
+          },
+          { webhookSecrets: TEST_WHSEC, legacySecretKey: TEST_PAYSTACK_KEY }
+        );
+      }).toThrow(/Paystack-Signature verification failed/i);
     });
   });
 });

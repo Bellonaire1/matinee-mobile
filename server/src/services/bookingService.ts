@@ -523,15 +523,23 @@ export class BookingService {
     for (const candidate of candidates) {
       try {
         const didExpire = await this.prisma.$transaction(async (tx) => {
-          // Explicit row-level lock on the booking record to synchronize with payment settlement
-          if (typeof (tx as any).$queryRaw === 'function') {
-            try {
-              await (tx as any).$queryRaw`
-                SELECT id, status, expires_at FROM bookings WHERE id = ${candidate.id}::uuid FOR UPDATE;
-              `;
-            } catch {
-              // Gracefully continue if running against mock client without raw SQL support
-            }
+          // Explicit row-level lock on the booking record to synchronize with payment settlement.
+          // Aborts entire transaction if row locking fails.
+          let lockedRows: any[];
+          try {
+            lockedRows = await (tx as any).$queryRaw`
+              SELECT id, status, expires_at FROM bookings WHERE id = ${candidate.id}::uuid FOR UPDATE;
+            `;
+          } catch (lockErr: any) {
+            throw new AppError(
+              `Row lock acquisition failed for booking '${candidate.id}': ${lockErr?.message || 'database lock error'}`,
+              500,
+              'ROW_LOCK_FAILED'
+            );
+          }
+
+          if (!lockedRows || lockedRows.length === 0) {
+            return false;
           }
 
           // Re-fetch inside transaction boundary with fresh payment attempts

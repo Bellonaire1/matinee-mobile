@@ -32,6 +32,14 @@ export class PaystackTestAdapter implements IPaymentProvider {
   private verificationStubs: Map<string, Partial<VerifyPaymentResult>> = new Map();
 
   constructor(config: PaystackAdapterConfig) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new AppError(
+        'Test payment adapter is not permitted in production environment',
+        500,
+        'TEST_ADAPTER_DISALLOWED_IN_PRODUCTION'
+      );
+    }
+
     if (!config.secretKey || !config.secretKey.trim()) {
       throw new AppError(
         'Paystack test secret key is required for payment adapter initialization',
@@ -58,6 +66,7 @@ export class PaystackTestAdapter implements IPaymentProvider {
 
   /**
    * Simulates Paystack transaction initialization without network calls.
+   * Registers a deterministic verification fixture for the initialized reference.
    */
   async initializePayment(
     params: InitializeProviderPaymentParams
@@ -83,6 +92,19 @@ export class PaystackTestAdapter implements IPaymentProvider {
     // during offline testing without explicit API authorization.
     const authorizationUrl = `urn:matinee:offline-test-checkout:${reference}`;
 
+    // Register deterministic test fixture for this initialized reference
+    this.verificationStubs.set(reference, {
+      success: true,
+      reference,
+      amountKobo,
+      currency: 'NGN',
+      status: 'success',
+      gatewayResponse: 'Successful',
+      channel: 'card',
+      paidAt: new Date(),
+      metadata: params.metadata,
+    });
+
     return {
       authorizationUrl,
       accessCode,
@@ -92,7 +114,7 @@ export class PaystackTestAdapter implements IPaymentProvider {
 
   /**
    * Simulates Paystack transaction verification without network calls.
-   * Checks the stub map for pre-configured test scenarios; defaults to verified success.
+   * Requires an explicit deterministic test fixture. Fails verification for unknown references.
    */
   async verifyPayment(reference: string): Promise<VerifyPaymentResult> {
     if (!reference || !reference.trim()) {
@@ -140,16 +162,15 @@ export class PaystackTestAdapter implements IPaymentProvider {
       };
     }
 
-    // Default simulated provider response: Successful payment in NGN
+    // Fail closed: Unknown or unstubbed reference must NEVER be fabricated as a success!
     return {
-      success: true,
+      success: false,
       reference: cleanRef,
-      amountKobo: 700000,
+      amountKobo: 0,
       currency: 'NGN',
-      status: 'success',
-      gatewayResponse: 'Successful',
-      channel: 'card',
-      paidAt: new Date(),
+      status: 'failed',
+      gatewayResponse: 'Unknown transaction reference; no test fixture registered',
+      channel: 'unknown',
     };
   }
 
