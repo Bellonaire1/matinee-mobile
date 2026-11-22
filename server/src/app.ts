@@ -48,13 +48,27 @@ export function createApp(): Express {
         }
       },
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Hold-Token'],
+      allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'Idempotency-Key',
+        'X-Hold-Token',
+        'Paystack-Signature',
+        'x-paystack-signature',
+      ],
       credentials: true,
     })
   );
 
-  // Body Parsing with controlled size limits
-  app.use(express.json({ limit: '1mb' }));
+  // Body Parsing with controlled size limits and rawBody retention for webhook signature verification
+  app.use(
+    express.json({
+      limit: '1mb',
+      verify: (req: any, _res, buf) => {
+        req.rawBody = buf;
+      },
+    })
+  );
   app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
   // Root redirect/fallback info

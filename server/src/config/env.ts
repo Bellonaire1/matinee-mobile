@@ -31,6 +31,7 @@ export const envSchema = z.object({
   TMDB_IMAGE_BASE_URL: z.string().url().default('https://image.tmdb.org/t/p'),
 
   // Test-Mode Payment Gateway Credentials (Milestone M05.3+)
+  PAYMENT_ENABLED: z.coerce.boolean().default(false),
   PAYMENT_PROVIDER: z.string().default('TEST_GATEWAY'),
   PAYMENT_TEST_SECRET_KEY: z.string().default('test_sk_placeholder'),
   PAYMENT_WEBHOOK_SECRET: z.string().default('test_whsec_placeholder'),

@@ -523,6 +523,17 @@ export class BookingService {
     for (const candidate of candidates) {
       try {
         const didExpire = await this.prisma.$transaction(async (tx) => {
+          // Explicit row-level lock on the booking record to synchronize with payment settlement
+          if (typeof (tx as any).$queryRaw === 'function') {
+            try {
+              await (tx as any).$queryRaw`
+                SELECT id, status, expires_at FROM bookings WHERE id = ${candidate.id}::uuid FOR UPDATE;
+              `;
+            } catch {
+              // Gracefully continue if running against mock client without raw SQL support
+            }
+          }
+
           // Re-fetch inside transaction boundary with fresh payment attempts
           const booking = await tx.booking.findUnique({
             where: { id: candidate.id },
