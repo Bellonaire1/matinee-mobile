@@ -23,6 +23,39 @@ import { colors } from '@/theme/colors';
 import { spacing } from '@/theme/spacing';
 import { radii } from '@/theme/radii';
 
+const TMDB_ATTRIBUTION = 'This product uses the TMDB API but is not endorsed or certified by TMDB.';
+
+function getInitials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return '?';
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
+function CastAvatar({ name, avatarUrl }: { name: string; avatarUrl?: string }) {
+  const [imageError, setImageError] = useState(false);
+  const initials = getInitials(name);
+
+  if (avatarUrl && avatarUrl.trim().length > 0 && !imageError) {
+    return (
+      <View style={styles.avatarWrapper}>
+        <Image
+          source={{ uri: avatarUrl }}
+          style={styles.avatarImage}
+          resizeMode="cover"
+          onError={() => setImageError(true)}
+        />
+      </View>
+    );
+  }
+
+  return (
+    <View style={[styles.avatarWrapper, styles.initialsAvatarWrapper]}>
+      <Text style={styles.avatarInitialsText}>{initials}</Text>
+    </View>
+  );
+}
+
 export default function MovieDetailsScreen() {
   const router = useRouter();
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -274,13 +307,7 @@ export default function MovieDetailsScreen() {
               >
                 {movie.cast.map((actor) => (
                   <View key={actor.id} style={styles.actorItem}>
-                    <View style={styles.avatarWrapper}>
-                      <Image
-                        source={{ uri: actor.avatarUrl }}
-                        style={styles.avatarImage}
-                        resizeMode="cover"
-                      />
-                    </View>
+                    <CastAvatar name={actor.name} avatarUrl={actor.avatarUrl} />
                     <Text
                       variant="supporting"
                       color="textPrimary"
@@ -360,11 +387,18 @@ export default function MovieDetailsScreen() {
                 </Text>
               </Card>
             )}
-            {attribution && (
+            <View style={styles.tmdbAttributionContainer}>
+              <Image
+                source={require('../../../assets/images/tmdb-logo.png')}
+                style={styles.tmdbLogo}
+                resizeMode="contain"
+                accessible={true}
+                accessibilityLabel="The Movie Database (TMDB) Logo"
+              />
               <Text variant="caption" color="textMuted" align="center" style={styles.attributionText}>
-                {attribution}
+                {attribution || TMDB_ATTRIBUTION}
               </Text>
-            )}
+            </View>
           </View>
         </View>
       </ScrollView>
@@ -601,6 +635,17 @@ const styles = StyleSheet.create({
     borderWidth: 1.5,
     borderColor: colors.border,
     marginBottom: spacing.xs,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  initialsAvatarWrapper: {
+    backgroundColor: colors.elevated,
+    borderColor: colors.border,
+  },
+  avatarInitialsText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: colors.primary,
   },
   avatarImage: {
     width: '100%',
@@ -681,10 +726,21 @@ const styles = StyleSheet.create({
   bookCTAButton: {
     flex: 1,
   },
-  attributionText: {
+  tmdbAttributionContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
     marginTop: spacing.lg,
+    gap: spacing.xs,
+  },
+  tmdbLogo: {
+    width: 48,
+    height: 35,
+    opacity: 0.8,
+  },
+  attributionText: {
     fontSize: 10,
     lineHeight: 14,
     paddingHorizontal: spacing.base,
+    maxWidth: 290,
   },
 });

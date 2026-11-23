@@ -79,6 +79,10 @@ export default function CheckoutPreviewScreen() {
     `sim_idemp_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`
   );
 
+  // Stable ref for the currently active hold token to ensure safe cleanup on unmount/back navigation
+  const activeHoldTokenRef = useRef<string | null>(null);
+  const isMountedRef = useRef<boolean>(true);
+
   // Derive auditorium domain model with approved tier base pricing
   const auditorium = useMemo(() => {
     return generateAuditoriumLayout(APPROVED_BASE_PRICE_KOBO);
@@ -108,9 +112,9 @@ export default function CheckoutPreviewScreen() {
 
   // Acquire simulated hold on mount
   useEffect(() => {
+    isMountedRef.current = true;
     if (!validationResult.isValid) return;
 
-    let isMounted = true;
     const showtimeId = validationResult.showtime.id;
     const seatIds = validationResult.selectionTotals.selectedSeats.map((s) => s.id);
     const totalPriceKobo = validationResult.selectionTotals.totalKobo;
@@ -118,22 +122,29 @@ export default function CheckoutPreviewScreen() {
     simulatedCheckoutEngine
       .acquireHold(showtimeId, seatIds, heldSeats, totalPriceKobo)
       .then((hold) => {
-        if (!isMounted) return;
+        if (!isMountedRef.current) {
+          // If component unmounted while acquireHold was pending, release immediately
+          simulatedCheckoutEngine.releaseHold(hold.holdToken).catch(() => {});
+          return;
+        }
+        activeHoldTokenRef.current = hold.holdToken;
         setHoldResult(hold);
         setSecondsRemaining(hold.expiresInSeconds);
         setExtensionCount(hold.extensionCount);
         setHoldExpired(false);
       })
       .catch((err) => {
-        if (!isMounted) return;
+        if (!isMountedRef.current) return;
         console.warn('Failed to acquire initial simulated hold:', err);
       });
 
     return () => {
-      isMounted = false;
-      // Release simulated hold on unmount / navigation away
-      if (holdResult?.holdToken) {
-        simulatedCheckoutEngine.releaseHold(holdResult.holdToken).catch(() => {});
+      isMountedRef.current = false;
+      // Release simulated hold on unmount / navigation away safely via stable ref
+      const tokenToRelease = activeHoldTokenRef.current;
+      if (tokenToRelease) {
+        activeHoldTokenRef.current = null;
+        simulatedCheckoutEngine.releaseHold(tokenToRelease).catch(() => {});
       }
     };
   }, [validationResult.isValid]);
@@ -158,27 +169,40 @@ export default function CheckoutPreviewScreen() {
 
   // Hold extension handler (+5 Mins)
   const handleExtendHold = useCallback(async () => {
-    if (!holdResult || holdExpired || extensionCount >= MAX_ALLOWED_EXTENSIONS) return;
+    const currentToken = activeHoldTokenRef.current || holdResult?.holdToken;
+    if (!currentToken || holdExpired || extensionCount >= MAX_ALLOWED_EXTENSIONS) return;
 
     try {
-      const res = await simulatedCheckoutEngine.extendHold(holdResult.holdToken);
+      const res = await simulatedCheckoutEngine.extendHold(currentToken);
+      if (!isMountedRef.current) return;
       setSecondsRemaining(res.expiresInSeconds);
       setExtensionCount(res.extensionCount);
       setHoldStatusMessage(res.message);
-      setTimeout(() => setHoldStatusMessage(null), 4000);
+      setTimeout(() => {
+        if (isMountedRef.current) {
+          setHoldStatusMessage(null);
+        }
+      }, 4000);
     } catch (err: any) {
+      if (!isMountedRef.current) return;
       setHoldStatusMessage(err?.message || 'Could not extend hold');
-      setTimeout(() => setHoldStatusMessage(null), 4000);
+      setTimeout(() => {
+        if (isMountedRef.current) {
+          setHoldStatusMessage(null);
+        }
+      }, 4000);
     }
   }, [holdResult, holdExpired, extensionCount]);
 
   // Clean back navigation releasing hold
   const handleBack = useCallback(() => {
-    if (holdResult?.holdToken) {
-      simulatedCheckoutEngine.releaseHold(holdResult.holdToken).catch(() => {});
+    const tokenToRelease = activeHoldTokenRef.current;
+    if (tokenToRelease) {
+      activeHoldTokenRef.current = null;
+      simulatedCheckoutEngine.releaseHold(tokenToRelease).catch(() => {});
     }
     router.back();
-  }, [holdResult, router]);
+  }, [router]);
 
   // Interactive Simulated Checkout Flow
   const handleExecuteSimulatedCheckout = useCallback(
@@ -207,7 +231,7 @@ export default function CheckoutPreviewScreen() {
         const showtimeId = validationResult.showtime.id;
         const seatIds = validationResult.selectionTotals.selectedSeats.map((s) => s.id);
         const totalPriceKobo = validationResult.selectionTotals.totalKobo;
-        const holdToken = holdResult?.holdToken || 'sim_hold_default';
+        const holdToken = activeHoldTokenRef.current || holdResult?.holdToken || 'sim_hold_default';
 
         // Step 1: Create transactional pending booking (preserving idempotencyKey)
         const booking = await simulatedCheckoutEngine.createBooking({
@@ -219,6 +243,9 @@ export default function CheckoutPreviewScreen() {
           holdToken,
           idempotencyKey: idempotencyKeyRef.current,
         });
+
+        // The hold is now converted into a pending booking in the engine
+        activeHoldTokenRef.current = null;
 
         // Step 2: Initialize test payment
         const paymentInit = await simulatedCheckoutEngine.initializePayment({
@@ -232,6 +259,8 @@ export default function CheckoutPreviewScreen() {
           reference: paymentInit.reference,
           outcome,
         });
+
+        if (!isMountedRef.current) return;
 
         if (outcome === 'succeeded') {
           setSimulationResult({
@@ -249,6 +278,7 @@ export default function CheckoutPreviewScreen() {
         }
         setShowResultModal(true);
       } catch (err: any) {
+        if (!isMountedRef.current) return;
         const msg = err?.message || 'Simulated checkout encountered an unexpected issue';
         if (msg.includes('expired')) {
           setHoldExpired(true);
@@ -264,7 +294,9 @@ export default function CheckoutPreviewScreen() {
         }
         setShowResultModal(true);
       } finally {
-        setIsProcessing(false);
+        if (isMountedRef.current) {
+          setIsProcessing(false);
+        }
       }
     },
     [

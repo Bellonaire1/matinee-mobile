@@ -25,6 +25,7 @@ class TestSimulatedCheckoutEngine {
     this.activeHolds = new Map();
     this.activeBookings = new Map();
     this.idempotencyRegistry = new Map();
+    this.paymentAttemptsByReference = new Map();
   }
 
   async acquireHold(showtimeId, seatIds, seats, totalPriceKobo) {
@@ -151,13 +152,24 @@ class TestSimulatedCheckoutEngine {
   async initializePayment(params) {
     const booking = this.activeBookings.get(params.bookingId);
     if (!booking) {
-      throw new Error('Booking order not found');
+      throw new Error(`Booking order not found for id: ${params.bookingId}`);
     }
 
     const reference = `SIM-PAY-${Date.now()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+    const paymentAttemptId = `sim_pay_${Math.random().toString(36).substring(2, 8)}`;
+
+    const attempt = {
+      id: paymentAttemptId,
+      reference,
+      bookingId: booking.id,
+      amountKobo: booking.totalKobo,
+      status: 'PENDING',
+      paidAt: null,
+    };
+    this.paymentAttemptsByReference.set(reference, attempt);
 
     return {
-      paymentAttemptId: `sim_pay_${Math.random().toString(36).substring(2, 8)}`,
+      paymentAttemptId,
       providerTransactionId: reference,
       authorizationUrl: `urn:matinee:offline-test-checkout:${reference}`,
       accessCode: `sim_ac_${reference}`,
@@ -171,33 +183,42 @@ class TestSimulatedCheckoutEngine {
   }
 
   async getPaymentStatus(params) {
-    const outcome = params.outcome || 'succeeded';
-    let bookingRef = 'SIM-MAT-SAMPLE';
-    let bookingId = 'sim_bkg_sample';
-    let totalKobo = 700000;
+    const attempt = this.paymentAttemptsByReference.get(params.reference);
+    if (!attempt) {
+      throw new Error(`Payment reference not found: ${params.reference}`);
+    }
 
-    for (const b of this.activeBookings.values()) {
-      bookingRef = b.bookingReference;
-      bookingId = b.id;
-      totalKobo = b.totalKobo;
-      if (outcome === 'succeeded') {
-        b.status = 'CONFIRMED';
+    const booking = this.activeBookings.get(attempt.bookingId);
+    if (!booking) {
+      throw new Error(`Associated booking not found for reference: ${params.reference}`);
+    }
+
+    const requestedOutcome = params.outcome || 'succeeded';
+
+    if (attempt.status === 'PENDING') {
+      if (requestedOutcome === 'succeeded') {
+        attempt.status = 'SUCCEEDED';
+        attempt.paidAt = new Date().toISOString();
+        booking.status = 'CONFIRMED';
+        booking.tickets.forEach((t) => (t.status = 'CONFIRMED'));
+      } else if (requestedOutcome === 'failed') {
+        attempt.status = 'FAILED';
+        attempt.failureReason = 'Simulated card declined by issuing bank';
       }
-      break;
     }
 
     return {
-      reference: params.reference,
-      status: outcome === 'succeeded' ? 'SUCCEEDED' : outcome === 'failed' ? 'FAILED' : 'PENDING',
-      amountKobo: totalKobo,
+      reference: attempt.reference,
+      status: attempt.status,
+      amountKobo: attempt.amountKobo,
       currency: 'NGN',
-      bookingId,
-      bookingStatus: outcome === 'succeeded' ? 'CONFIRMED' : 'PENDING',
-      bookingReference: bookingRef,
+      bookingId: booking.id,
+      bookingStatus: booking.status,
+      bookingReference: booking.bookingReference,
       requiresRefund: false,
-      paidAt: outcome === 'succeeded' ? new Date().toISOString() : null,
+      paidAt: attempt.paidAt,
       isSimulated: true,
-      failureReason: outcome === 'failed' ? 'Simulated card declined by issuing bank' : undefined,
+      failureReason: attempt.failureReason,
     };
   }
 }
@@ -294,14 +315,6 @@ async function runTests() {
   assert.strictEqual(successStatus.isSimulated, true);
   console.log('  ✓ Simulated payment settlement: SUCCEEDED');
 
-  const failStatus = await engine.getPaymentStatus({
-    reference: payInit.reference,
-    outcome: 'failed',
-  });
-  assert.strictEqual(failStatus.status, 'FAILED');
-  assert.strictEqual(failStatus.failureReason, 'Simulated card declined by issuing bank');
-  console.log('  ✓ Simulated payment settlement: FAILED (card declined retryable)');
-
   // Test 7: Hold release
   console.log('\nSUITE 4: Clean Hold Release');
   const hold2 = await engine.acquireHold('showtime-2', ['A-1'], [mockSeats[0]], 700000);
@@ -316,8 +329,104 @@ async function runTests() {
   assert.strictEqual(useReleasedRejected, true, 'Released hold cannot be extended');
   console.log('  ✓ Hold release cleanly deletes hold record');
 
+  // Test 8: Defect A - Stale Hold Cleanup & React Ref Lifecycle
+  console.log('\nSUITE 5: Defect A - Hold Cleanup & Stable Ref Lifecycle');
+  let activeHoldTokenRef = null;
+  let isMounted = true;
+
+  // Simulate screen mount acquiring hold
+  const holdSessionA = await engine.acquireHold('showtime-3', ['C-1'], [mockSeats[0]], 700000);
+  if (isMounted) {
+    activeHoldTokenRef = holdSessionA.holdToken;
+  }
+  assert.strictEqual(engine.activeHolds.has(holdSessionA.holdToken), true, 'Hold must be active');
+
+  // Simulate back navigation calling handleBack
+  const tokenToRelease = activeHoldTokenRef;
+  if (tokenToRelease) {
+    activeHoldTokenRef = null;
+    await engine.releaseHold(tokenToRelease);
+  }
+  assert.strictEqual(engine.activeHolds.has(holdSessionA.holdToken), false, 'Back navigation must release hold');
+
+  // Simulate unmount cleanup: should be idempotent and not release another session's hold
+  const holdSessionB = await engine.acquireHold('showtime-4', ['D-1'], [mockSeats[0]], 700000);
+  // Unmount effect runs:
+  isMounted = false;
+  const unmountToken = activeHoldTokenRef; // is null because handleBack already cleared it!
+  if (unmountToken) {
+    activeHoldTokenRef = null;
+    await engine.releaseHold(unmountToken);
+  }
+  // Session B hold must still be active!
+  assert.strictEqual(engine.activeHolds.has(holdSessionB.holdToken), true, 'Unmount cleanup must never release another session hold');
+  await engine.releaseHold(holdSessionB.holdToken);
+  console.log('  ✓ Stable ref cleanup prevents stale hold leaks and isolates distinct sessions');
+
+  // Test 9: Defect B - Explicit Reference-to-Booking Mapping & Isolation
+  console.log('\nSUITE 6: Defect B - Payment Reference Association & Multi-Session Isolation');
+  // Create two distinct bookings
+  const holdA = await engine.acquireHold('showtime-A', ['A-1'], [mockSeats[0]], 700000);
+  const bookingA = await engine.createBooking({
+    showtimeId: 'showtime-A',
+    seatIds: ['A-1'],
+    contactEmail: 'userA@example.com',
+    totalPriceKobo: 700000,
+    holdToken: holdA.holdToken,
+    idempotencyKey: 'idemp_session_A',
+  });
+  const payInitA = await engine.initializePayment({ bookingId: bookingA.id, email: 'userA@example.com' });
+
+  const holdB = await engine.acquireHold('showtime-B', ['B-1'], [mockSeats[1]], 700000);
+  const bookingB = await engine.createBooking({
+    showtimeId: 'showtime-B',
+    seatIds: ['B-1'],
+    contactEmail: 'userB@example.com',
+    totalPriceKobo: 700000,
+    holdToken: holdB.holdToken,
+    idempotencyKey: 'idemp_session_B',
+  });
+  const payInitB = await engine.initializePayment({ bookingId: bookingB.id, email: 'userB@example.com' });
+
+  // 1. Unknown reference must throw an error
+  let unknownRefRejected = false;
+  try {
+    await engine.getPaymentStatus({ reference: 'SIM-PAY-NONEXISTENT' });
+  } catch (err) {
+    unknownRefRejected = true;
+    assert(err.message.includes('Payment reference not found'), 'Should reject unknown reference');
+  }
+  assert.strictEqual(unknownRefRejected, true, 'Unknown reference must be rejected');
+  console.log('  ✓ Unknown reference throws an error');
+
+  // 2. Failed settlement on booking A must NOT confirm booking A or touch booking B
+  const statusA_fail = await engine.getPaymentStatus({ reference: payInitA.reference, outcome: 'failed' });
+  assert.strictEqual(statusA_fail.status, 'FAILED');
+  assert.strictEqual(statusA_fail.bookingStatus, 'PENDING');
+  assert.strictEqual(bookingA.status, 'PENDING');
+  assert.strictEqual(bookingA.tickets[0].status, 'PENDING_PAYMENT');
+  assert.strictEqual(bookingB.status, 'PENDING');
+  console.log('  ✓ Failed settlement does not confirm tickets or affect other bookings');
+
+  // 3. Successful settlement on booking B must confirm only booking B
+  const statusB_succ = await engine.getPaymentStatus({ reference: payInitB.reference, outcome: 'succeeded' });
+  assert.strictEqual(statusB_succ.status, 'SUCCEEDED');
+  assert.strictEqual(statusB_succ.bookingStatus, 'CONFIRMED');
+  assert.strictEqual(statusB_succ.bookingReference, bookingB.bookingReference);
+  assert.strictEqual(bookingB.status, 'CONFIRMED');
+  assert.strictEqual(bookingB.tickets[0].status, 'CONFIRMED');
+  assert.strictEqual(bookingA.status, 'PENDING', 'Booking A must remain PENDING');
+  console.log('  ✓ Exact reference maps directly to exact booking; sessions remain strictly isolated');
+
+  // 4. Repeated status lookup is stable
+  const statusB_repeat = await engine.getPaymentStatus({ reference: payInitB.reference });
+  assert.strictEqual(statusB_repeat.status, 'SUCCEEDED');
+  assert.strictEqual(statusB_repeat.paidAt, statusB_succ.paidAt, 'paidAt must be identical on repeat lookup');
+  assert.strictEqual(statusB_repeat.bookingStatus, 'CONFIRMED');
+  console.log('  ✓ Repeated status lookup is stable and idempotent');
+
   console.log('\n======================================================');
-  console.log('ALL 7 CHECKOUT SIMULATION INVARIANTS PASSED VERIFICATION');
+  console.log('ALL CHECKOUT SIMULATION INVARIANTS PASSED VERIFICATION');
   console.log('======================================================');
 }
 

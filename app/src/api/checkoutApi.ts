@@ -102,6 +102,16 @@ export interface PaymentStatusResult {
 // Offline Simulation Engine (In-Memory Realistic State)
 // -----------------------------------------------------------------------------
 
+interface SimulatedPaymentAttempt {
+  id: string;
+  reference: string;
+  bookingId: string;
+  amountKobo: number;
+  status: 'PENDING' | 'SUCCEEDED' | 'FAILED';
+  paidAt: string | null;
+  failureReason?: string;
+}
+
 class SimulatedCheckoutEngine {
   private activeHolds: Map<string, {
     token: string;
@@ -116,6 +126,7 @@ class SimulatedCheckoutEngine {
 
   private activeBookings: Map<string, BookingResult> = new Map();
   private idempotencyRegistry: Map<string, BookingResult> = new Map();
+  private paymentAttemptsByReference: Map<string, SimulatedPaymentAttempt> = new Map();
 
   /**
    * Simulates acquiring an atomic seat hold (POST /api/v1/showtimes/:id/holds).
@@ -284,13 +295,24 @@ class SimulatedCheckoutEngine {
   }): Promise<PaymentInitResult> {
     const booking = this.activeBookings.get(params.bookingId);
     if (!booking) {
-      throw new Error('Booking order not found');
+      throw new Error(`Booking order not found for id: ${params.bookingId}`);
     }
 
     const reference = `SIM-PAY-${Date.now()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+    const paymentAttemptId = `sim_pay_${Math.random().toString(36).substring(2, 8)}`;
+
+    const attempt: SimulatedPaymentAttempt = {
+      id: paymentAttemptId,
+      reference,
+      bookingId: booking.id,
+      amountKobo: booking.totalKobo,
+      status: 'PENDING',
+      paidAt: null,
+    };
+    this.paymentAttemptsByReference.set(reference, attempt);
 
     return {
-      paymentAttemptId: `sim_pay_${Math.random().toString(36).substring(2, 8)}`,
+      paymentAttemptId,
       providerTransactionId: reference,
       authorizationUrl: `urn:matinee:offline-test-checkout:${reference}`,
       accessCode: `sim_ac_${reference}`,
@@ -305,41 +327,50 @@ class SimulatedCheckoutEngine {
 
   /**
    * Simulates payment status inquiry (GET /api/v1/payments/status/:reference).
+   * Resolves exact payment reference -> payment attempt -> booking.
    */
   async getPaymentStatus(params: {
     reference: string;
     outcome?: 'succeeded' | 'failed' | 'pending';
   }): Promise<PaymentStatusResult> {
-    const outcome = params.outcome || 'succeeded';
+    const attempt = this.paymentAttemptsByReference.get(params.reference);
+    if (!attempt) {
+      throw new Error(`Payment reference not found: ${params.reference}`);
+    }
 
-    let bookingRef = 'SIM-MAT-SAMPLE';
-    let bookingId = 'sim_bkg_sample';
-    let totalKobo = 700000;
+    const booking = this.activeBookings.get(attempt.bookingId);
+    if (!booking) {
+      throw new Error(`Associated booking not found for reference: ${params.reference}`);
+    }
 
-    // Look for matching active booking if available
-    for (const b of this.activeBookings.values()) {
-      bookingRef = b.bookingReference;
-      bookingId = b.id;
-      totalKobo = b.totalKobo;
-      if (outcome === 'succeeded') {
-        b.status = 'CONFIRMED';
-        b.tickets.forEach((t) => (t.status = 'CONFIRMED'));
+    const requestedOutcome = params.outcome || 'succeeded';
+
+    // If attempt is still pending, update its status according to the requested outcome
+    if (attempt.status === 'PENDING') {
+      if (requestedOutcome === 'succeeded') {
+        attempt.status = 'SUCCEEDED';
+        attempt.paidAt = new Date().toISOString();
+        booking.status = 'CONFIRMED';
+        booking.tickets.forEach((t) => (t.status = 'CONFIRMED'));
+      } else if (requestedOutcome === 'failed') {
+        attempt.status = 'FAILED';
+        attempt.failureReason = 'Simulated card declined by issuing bank';
+        // Note: Booking and tickets stay in existing PENDING state and are NOT confirmed!
       }
-      break;
     }
 
     return {
-      reference: params.reference,
-      status: outcome === 'succeeded' ? 'SUCCEEDED' : outcome === 'failed' ? 'FAILED' : 'PENDING',
-      amountKobo: totalKobo,
+      reference: attempt.reference,
+      status: attempt.status,
+      amountKobo: attempt.amountKobo,
       currency: 'NGN',
-      bookingId,
-      bookingStatus: outcome === 'succeeded' ? 'CONFIRMED' : 'PENDING',
-      bookingReference: bookingRef,
+      bookingId: booking.id,
+      bookingStatus: booking.status,
+      bookingReference: booking.bookingReference,
       requiresRefund: false,
-      paidAt: outcome === 'succeeded' ? new Date().toISOString() : null,
+      paidAt: attempt.paidAt,
       isSimulated: true,
-      failureReason: outcome === 'failed' ? 'Simulated card declined by issuing bank' : undefined,
+      failureReason: attempt.failureReason,
     };
   }
 }

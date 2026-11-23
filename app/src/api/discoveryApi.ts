@@ -143,7 +143,7 @@ export function mapBackendMovieToUiMovie(bm: BackendMovie): Movie {
       id: c.id || `cast-${idx}`,
       name: c.name,
       character: c.character,
-      avatarUrl: c.avatarUrl || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
+      avatarUrl: c.avatarUrl || '',
     })),
     category:
       bm.category === 'COMING_SOON'

@@ -5,6 +5,7 @@ import {
   ScrollView,
   TouchableOpacity,
   Modal,
+  Image,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
@@ -229,6 +230,18 @@ export default function ProfileScreen() {
           <Text variant="caption" color="textSecondary" align="center">
             {APP_SYSTEM_DIAGNOSTICS.sdk} &bull; {APP_SYSTEM_DIAGNOSTICS.router}
           </Text>
+          <View style={styles.tmdbAttributionContainer}>
+            <Image
+              source={require('../../../assets/images/tmdb-logo.png')}
+              style={styles.tmdbLogo}
+              resizeMode="contain"
+              accessible={true}
+              accessibilityLabel="The Movie Database (TMDB) Logo"
+            />
+            <Text variant="caption" color="textSecondary" align="center" style={styles.tmdbNoticeText}>
+              Movie data and artwork sourced from TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB.
+            </Text>
+          </View>
         </View>
       </ScrollView>
 
@@ -412,6 +425,22 @@ const styles = StyleSheet.create({
   versionFooter: {
     paddingVertical: spacing.sm,
     gap: 2,
+  },
+  tmdbAttributionContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: spacing.md,
+    gap: spacing.xs,
+  },
+  tmdbLogo: {
+    width: 60,
+    height: 43,
+    opacity: 0.85,
+  },
+  tmdbNoticeText: {
+    fontSize: 10,
+    lineHeight: 14,
+    maxWidth: 290,
   },
   modalBackdrop: {
     flex: 1,
