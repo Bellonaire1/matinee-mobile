@@ -5,7 +5,7 @@
 
 ### 1. Overview & Purpose
 
-This directory contains the automated **k6** load-testing suite for the Matinee cinema booking platform, built specifically to fulfill **Part 2.4 Mobile Task B (Graduation Requirement #16)**:
+This directory contains the automated **k6** load-testing harness for the Matinee cinema booking platform, built specifically to fulfill **Part 2.4 Mobile Task B (Graduation Requirement #16)**:
 
 > *"500 virtual users competing for the same 50 seats, demonstrating zero double-bookings, response times, and error rates."*
 
@@ -20,8 +20,10 @@ The load-test harness verifies the two independent layers protecting Matinee aga
 │  Layer 1: Redis In-Memory Hold Leases (Fast Contention Gate)           │
 │  - Endpoint: POST /api/v1/holds                                        │
 │  - Mechanism: Atomic Lua script executing SET NX EX 600                │
-│  - Outcome: Exactly 50 VUs win holds; ~450 losers receive HTTP 409     │
-│    (SEAT_HOLD_CONFLICT) within < 10ms without database overhead        │
+│  - Fail-Closed Policy: If Redis is unreachable, backend returns 503    │
+│    (HOLD_SERVICE_UNAVAILABLE) to prevent uncoordinated local holds    │
+│  - Expected Outcome: Exactly 50 VUs win holds; ~450 losers receive     │
+│    HTTP 409 (SEAT_HOLD_CONFLICT) without touching database storage     │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │ (Hold Winners Only)
                                     ▼
@@ -30,8 +32,8 @@ The load-test harness verifies the two independent layers protecting Matinee aga
 │  - Endpoint: POST /api/v1/bookings (with X-Hold-Token header)          │
 │  - Mechanism: Index uq_active_showtime_seat ON tickets(showtime, seat) │
 │    WHERE status IN ('PENDING_PAYMENT', 'CONFIRMED', 'CHECKED_IN', ...) │
-│  - Outcome: Even if a cache lease failed, the database rejects any     │
-│    duplicate allocation with error code P2002 (HTTP 409)               │
+│  - Expected Outcome: 50 winning holds transition to PENDING bookings;  │
+│    any theoretical duplicate is rejected by PostgreSQL with P2002     │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -47,15 +49,19 @@ To ensure honest engineering assessment, the load test distinguishes three disti
 
 ---
 
-### 4. Safety Guardrails & Preconditions
+### 4. Strict Safety Guardrails & Preconditions
 
 > [!CAUTION]
 > **STRICT SAFETY INVARIANT**:
-> **NEVER execute this 500-VU load test against the production environment or the protected Neon main database!**
+> **NEVER execute this 500-VU load test against the production environment or the protected Neon main database branch (`br-small-frog-bjztb5yj`)!**
 
-The test harness enforces two mandatory safety checks:
-1. **`MATINEE_ALLOW_LOAD_TEST=true`**: If this environment variable is missing, the script aborts immediately.
-2. **Production URL Filter**: If `BASE_URL` contains `neon.tech`, `production`, `prod.`, `matinee.ng`, or `api.matinee.com`, the script aborts immediately.
+The harness enforces strict fail-closed safety checks:
+1. **`MATINEE_ALLOW_LOAD_TEST=true`**: Required flag confirming test authorization.
+2. **`CONFIRM_DISPOSABLE_DATABASE=true`**: Required flag confirming target database is a disposable test branch.
+3. **`DISPOSABLE_ENV_ID`**: Required staging identifier (rejects `main`, `prod`, `production`, `br-small-frog-bjztb5yj`).
+4. **Production URL Blocklist**: Automatically aborts if `BASE_URL` contains `neon.tech`, `production`, `prod.`, `matinee.ng`, or `api.matinee.com`.
+5. **No Placeholder UUIDs**: Aborts if `SHOWTIME_ID` or fixture `seatIds` contain placeholder UUIDs (`11111111-...` or `00000000-...`).
+6. **Mandatory Post-Test Audit**: Requires running `load-tests/audit.sql` to verify that active ticket allocations in PostgreSQL match expectations and have zero duplicates.
 
 ---
 
@@ -63,18 +69,9 @@ The test harness enforces two mandatory safety checks:
 
 k6 is required to execute this load test. If k6 is not installed on your system:
 
-- **Windows (Chocolatey)**:
-  ```powershell
-  choco install k6
-  ```
-- **Windows (Winget)**:
-  ```powershell
-  winget install k6 --source winget
-  ```
-- **macOS (Homebrew)**:
-  ```bash
-  brew install k6
-  ```
+- **Windows (Chocolatey)**: `choco install k6`
+- **Windows (Winget)**: `winget install k6 --source winget`
+- **macOS (Homebrew)**: `brew install k6`
 - **Linux (Debian/Ubuntu)**:
   ```bash
   sudo gpg -k
@@ -85,19 +82,23 @@ k6 is required to execute this load test. If k6 is not installed on your system:
 
 ---
 
-### 6. Executing the Load Test
+### 6. Executing the Load Test (Step-by-Step)
 
-#### Step 1: Prepare Disposable Staging Environment
-Deploy the backend to a disposable staging container or local environment connected to a disposable test database branch and test Redis instance. Ensure a test screening session exists with at least 50 available seats.
+Follow the complete step-by-step procedure detailed in [STAGING_RUNBOOK.md](file:///c:/Users/USER/matinee-mobile/load-tests/STAGING_RUNBOOK.md):
 
-#### Step 2: Configure Environment Variables
-Set the target parameters:
+#### Step 1: Pre-Run Database Verification
+Run Section 1 and Section 2 of `load-tests/audit.sql` to verify database branch identity and generate `load-tests/fixtures/seats.staging.json` containing 50 real seat UUIDs.
+
+#### Step 2: Configure Environment Variables & Run
 
 ```powershell
 # PowerShell (Windows)
 $env:MATINEE_ALLOW_LOAD_TEST="true"
-$env:BASE_URL="http://localhost:3000"
-$env:SHOWTIME_ID="11111111-2222-3333-4444-555555555555"
+$env:CONFIRM_DISPOSABLE_DATABASE="true"
+$env:DISPOSABLE_ENV_ID="staging-run-01"
+$env:BASE_URL="https://staging-api.matinee.internal"
+$env:SHOWTIME_ID="<real-staging-showtime-uuid>"
+$env:SEAT_FIXTURE_PATH="./fixtures/seats.staging.json"
 $env:VUS="500"
 
 k6 run load-tests/concurrency_500_vu.js
@@ -106,29 +107,39 @@ k6 run load-tests/concurrency_500_vu.js
 ```bash
 # Bash (Linux / macOS)
 export MATINEE_ALLOW_LOAD_TEST="true"
+export CONFIRM_DISPOSABLE_DATABASE="true"
+export DISPOSABLE_ENV_ID="staging-run-01"
 export BASE_URL="https://staging-api.matinee.internal"
-export SHOWTIME_ID="11111111-2222-3333-4444-555555555555"
+export SHOWTIME_ID="<real-staging-showtime-uuid>"
+export SEAT_FIXTURE_PATH="./fixtures/seats.staging.json"
 export VUS="500"
 
 k6 run load-tests/concurrency_500_vu.js
 ```
 
+#### Step 3: Mandatory Post-Run Database Audit
+Run Section 4 of `load-tests/audit.sql` directly against PostgreSQL to confirm zero duplicate active tickets exist for the showtime.
+
 ---
 
-### 7. Target Pass / Fail Thresholds
+### 7. Target Pass / Fail / Incomplete Criteria
 
 | Metric | Target | Rationale |
 |---|---|---|
 | **Duplicate Allocations** | **Strictly 0** | Core graduation concurrency requirement. |
-| **Successful Holds** | **$\le 50$** | Cannot exceed the 50 contested seats. |
-| **Clean Conflicts** | **$\approx 450$** | Losing VUs receive clean HTTP 409 without server crashing. |
+| **Successful Holds** | **Exactly 50** | All 50 contested seats held (empty runs flagged `INCOMPLETE`). |
+| **Successful Bookings** | **Exactly 50** | All 50 held seats converted to `PENDING` bookings. |
+| **Clean Conflicts** | **$\approx 450$** | Losing VUs receive clean HTTP 409 without server crashes. |
 | **Unexpected 5xx Errors** | **Strictly 0** | Zero unhandled exceptions or connection crashes. |
-| **p95 Request Duration** | **$< 1,000\text{ ms}$** | Responsive API even under sudden 500-user spike. |
+| **Service Down 503s** | **Strictly 0** | Proves Redis remained healthy under 500-concurrency burst. |
+| **Rate-Limited 429s** | **0** | Confirms rate-limiting did not starve the contention test. |
+| **p95 Request Duration** | **$< 1,000\text{ ms}$** | Target SLO under sudden 500-VU spike. |
 
 ---
 
 ### 8. Output Artifacts
 
 Upon completion, the test generates:
-1. **Console Terminal Report**: Standard k6 summary with custom metrics.
+1. **Console Terminal Report**: Standard k6 summary with custom metrics and explicit verdict.
 2. **`load-tests/summary.json`**: Machine-readable JSON output for automated CI/CD evaluation and graduation demo evidence.
+3. **Database Audit Evidence**: Output of `load-tests/audit.sql` confirming zero database duplicate active tickets.

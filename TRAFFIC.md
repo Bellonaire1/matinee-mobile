@@ -29,7 +29,7 @@ Matinee eliminates double-booking through an architectural dual-layer lock strat
 ┌──────────────────────────────────────────────┐
 │  Layer 1: Fast Redis Atomic Hold Leases     │  --> 99% of contention blocked here
 │  - Lua script with SET NX EX (600s TTL)      │      Zero database writes for losers
-│  - Instant rejection (< 5ms response time)   │
+│  - Instant in-memory rejection (O(1) Lua)    │
 └──────────────────────┬───────────────────────┘
                        │ (Only hold winner advances)
                        ▼
@@ -121,7 +121,7 @@ Matinee applies rate limiting across three distinct functional tiers using Expre
 ## 8. Graceful Overload & Degraded Behavior
 
 When system components experience degraded health or extreme spikes:
-1. **Redis Unavailable**: If the Redis cache fails, the hold service logs a high-severity alert and falls back to serial database transactional row locking (`SELECT FOR UPDATE`), sacrificing high-throughput speed to preserve zero double-bookings.
+1. **Redis Unavailable**: If the Redis cache fails or is unconfigured (`REDIS_URL` missing or unreachable), the hold service **fails closed** with `HTTP 503 Service Unavailable` (`HOLD_SERVICE_UNAVAILABLE`). The backend strictly rejects new seat hold acquisitions rather than attempting uncoordinated in-memory state across multi-instance nodes or overwhelming the database with unindexed contention.
 2. **Database Overload**: If connection pool wait times exceed 2,000ms, the API returns `HTTP 503 Service Busy` with an amber notice advising users that box office queues are temporarily saturated.
 3. **TMDB Outage**: If the external TMDB API is unreachable, the backend serves cached metadata, and the mobile client falls back to curated local offline catalogs.
 
@@ -154,17 +154,24 @@ It is critical to distinguish the three operational stages tested:
 ### Safety Preconditions
 > [!CAUTION]
 > **DO NOT execute this load test against the production environment or the protected Neon main database!**
-> The script includes hardcoded safety checks:
+> The harness enforces strict fail-closed safety checks:
 > 1. Requires `MATINEE_ALLOW_LOAD_TEST=true`.
-> 2. Automatically aborts if `BASE_URL` contains `neon.tech`, `production`, `prod.`, `matinee.ng`, or `api.matinee.com`.
+> 2. Requires `CONFIRM_DISPOSABLE_DATABASE=true`.
+> 3. Requires `DISPOSABLE_ENV_ID="staging-run-XX"` (rejects `main`, `prod`, `br-small-frog-bjztb5yj`).
+> 4. Automatically aborts if `BASE_URL` contains `neon.tech`, `production`, `prod.`, `matinee.ng`, or `api.matinee.com`.
+> 5. Rejects placeholder showtime IDs (`11111111-...`) and placeholder seat IDs (`00000000-...`).
+> 6. Requires pre/post-test database validation using `load-tests/audit.sql`.
 
 ### Exact Execution Commands
 
 ```powershell
 # PowerShell (Windows)
 $env:MATINEE_ALLOW_LOAD_TEST="true"
-$env:BASE_URL="http://localhost:3000"
-$env:SHOWTIME_ID="11111111-2222-3333-4444-555555555555"
+$env:CONFIRM_DISPOSABLE_DATABASE="true"
+$env:DISPOSABLE_ENV_ID="staging-run-01"
+$env:BASE_URL="https://staging-api.matinee.internal"
+$env:SHOWTIME_ID="<real-staging-showtime-uuid>"
+$env:SEAT_FIXTURE_PATH="./fixtures/seats.staging.json"
 $env:VUS="500"
 
 k6 run load-tests/concurrency_500_vu.js
@@ -173,8 +180,11 @@ k6 run load-tests/concurrency_500_vu.js
 ```bash
 # Bash (Linux / macOS)
 export MATINEE_ALLOW_LOAD_TEST="true"
+export CONFIRM_DISPOSABLE_DATABASE="true"
+export DISPOSABLE_ENV_ID="staging-run-01"
 export BASE_URL="https://staging-api.matinee.internal"
-export SHOWTIME_ID="11111111-2222-3333-4444-555555555555"
+export SHOWTIME_ID="<real-staging-showtime-uuid>"
+export SEAT_FIXTURE_PATH="./fixtures/seats.staging.json"
 export VUS="500"
 
 k6 run load-tests/concurrency_500_vu.js
@@ -184,14 +194,18 @@ k6 run load-tests/concurrency_500_vu.js
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `MATINEE_ALLOW_LOAD_TEST` | **YES** | `false` | Mandatory safety gate preventing accidental execution. |
-| `BASE_URL` | Optional | `http://localhost:3000` | Target staging API endpoint (no trailing slash). |
-| `SHOWTIME_ID` | Optional | `11111111-2222-3333-4444-555555555555` | Test screening session ID in database. |
+| `CONFIRM_DISPOSABLE_DATABASE` | **YES** | `false` | Mandatory confirmation that DB is disposable (never Neon main branch). |
+| `DISPOSABLE_ENV_ID` | **YES** | None | Unique disposable staging run identifier (e.g. `staging-run-01`). |
+| `BASE_URL` | **YES** | None | Target staging API endpoint (no trailing slash). |
+| `SHOWTIME_ID` | **YES** | None | Real test screening session UUID in staging database. |
+| `SEAT_FIXTURE_PATH` | Optional | `./fixtures/seats.staging.json` | Path to JSON fixture containing 50 valid staging seat UUIDs. |
 | `VUS` | Optional | `500` | Number of concurrent virtual users. |
 
 ### Expected Test Data & Fixtures
-- Showtime record in PostgreSQL with status `OPEN_FOR_BOOKING` and `startTime > now()`.
-- Auditorium with at least 50 active seats configured.
-- Fixture file: `load-tests/fixtures/seats.example.json` containing 50 valid seat UUIDs.
+- Showtime record in disposable staging PostgreSQL with status `OPEN_FOR_BOOKING` and `startTime > now()`.
+- Auditorium with at least 50 active single seats configured.
+- Fixture file: `load-tests/fixtures/seats.staging.json` containing exactly 50 valid, unique seat UUIDs generated via `load-tests/audit.sql`.
+- Post-run database audit query executed via `load-tests/audit.sql` to confirm zero duplicate active tickets.
 
 ---
 

@@ -17,7 +17,13 @@ const strictBooleanSchema = z.preprocess((val) => {
 
 export const envSchema = z
   .object({
-    NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+    NODE_ENV: z.enum(['development', 'production', 'test', 'staging']).default('development'),
+    APP_ENV: z.enum(['development', 'production', 'test', 'staging']).optional(),
+    DEPLOYMENT_ENV: z.enum(['development', 'production', 'test', 'staging']).optional(),
+    STAGING_ENV_ID: z.string().optional(),
+    DISPOSABLE_ENV_ID: z.string().optional(),
+    EXPECTED_NEON_BRANCH_ENDPOINT: z.string().optional(),
+    STAGING_VERIFY_DISPOSABLE_DB: strictBooleanSchema.default(false),
     PORT: z.coerce.number().int().positive().default(4000),
     API_PREFIX: z.string().default('/api/v1'),
     CORS_ORIGIN: z.string().default('http://localhost:3000,http://localhost:8081'),
