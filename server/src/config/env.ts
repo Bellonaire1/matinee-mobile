@@ -41,6 +41,16 @@ export const envSchema = z
     JWT_SECRET: z.string().min(16).default('development-jwt-secret-placeholder-minimum-16-chars'),
     JWT_EXPIRES_IN: z.string().default('7d'),
 
+    // Staff authentication is disabled until a real secret is provisioned.
+    STAFF_AUTH_ENABLED: strictBooleanSchema.default(false),
+    STAFF_AUTH_JWT_SECRET: z.string().optional(),
+    STAFF_AUTH_ISSUER: z.string().default('matinee-staff-auth'),
+    STAFF_AUTH_AUDIENCE: z.string().default('matinee-staff-scanner'),
+    STAFF_AUTH_TTL_SECONDS: z.coerce.number().int().positive().default(900),
+    STAFF_AUTH_LOGIN_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
+    STAFF_AUTH_LOGIN_ACCOUNT_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+    STAFF_AUTH_LOGIN_SOURCE_MAX_ATTEMPTS: z.coerce.number().int().positive().default(20),
+
     // The Movie Database (TMDB) API Proxy (Milestone M05.2)
     TMDB_API_KEY: z.string().default('placeholder_tmdb_api_key'),
     TMDB_ACCESS_TOKEN: z.string().default('placeholder_tmdb_access_token'),
@@ -52,6 +62,13 @@ export const envSchema = z
     PAYMENT_PROVIDER: z.string().default('TEST_GATEWAY'),
     PAYMENT_TEST_SECRET_KEY: z.string().default('test_sk_placeholder'),
     PAYMENT_WEBHOOK_SECRET: z.string().default('test_whsec_placeholder'),
+
+    // Admission ticket signing configuration. No default signing key is allowed.
+    TICKET_QR_SIGNING_KEY: z.string().optional(),
+    TICKET_QR_SIGNING_KEY_ID: z.string().optional(),
+    TICKET_QR_ISSUER: z.string().default('matinee-admission'),
+    TICKET_QR_AUDIENCE: z.string().default('matinee-scanner'),
+    TICKET_QR_TTL_SECONDS: z.coerce.number().int().positive().default(86400),
   })
   .superRefine((data, ctx) => {
     if (data.PAYMENT_ENABLED) {
@@ -92,6 +109,20 @@ export const envSchema = z
         });
       }
     }
+
+    if (data.STAFF_AUTH_ENABLED) {
+      if (
+        !data.STAFF_AUTH_JWT_SECRET ||
+        data.STAFF_AUTH_JWT_SECRET.trim().length < 32 ||
+        /placeholder|development|changeme|secret/i.test(data.STAFF_AUTH_JWT_SECRET)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['STAFF_AUTH_JWT_SECRET'],
+          message: 'STAFF_AUTH_JWT_SECRET must be a real secret of at least 32 bytes when staff auth is enabled',
+        });
+      }
+    }
   });
 
 export type Env = z.infer<typeof envSchema>;
@@ -108,4 +139,3 @@ export function parseEnv(rawEnv: NodeJS.ProcessEnv = process.env): Env {
 }
 
 export const env: Env = parseEnv();
-

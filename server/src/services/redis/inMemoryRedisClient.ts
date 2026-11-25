@@ -6,6 +6,7 @@ import {
   RELEASE_IDEMPOTENCY_LOCK_LUA,
   COMPLETE_IDEMPOTENCY_LUA,
   RELEASE_LOCK_LUA,
+  STAFF_LOGIN_RATE_LIMIT_LUA,
 } from './luaScripts.js';
 
 interface MemoryEntry {
@@ -113,6 +114,30 @@ export class InMemoryRedisClient implements IRedisClient {
     ...args: (string | number)[]
   ): Promise<unknown> {
     if (!this.healthy) throw new Error('InMemoryRedisClient is down');
+
+    if (script === STAFF_LOGIN_RATE_LIMIT_LUA) {
+      if (numKeys !== 2 || args.length !== 5) throw new Error('Invalid staff login rate-limit arguments');
+      const accountKey = String(args[0]);
+      const sourceKey = String(args[1]);
+      const windowSeconds = Number(args[2]);
+      const accountLimit = Number(args[3]);
+      const sourceLimit = Number(args[4]);
+      const increment = (key: string): number => {
+        this.cleanExpired(key);
+        const current = Number(this.store.get(key)?.value || 0) + 1;
+        const expiresAt = this.store.get(key)?.expiresAt || Date.now() + windowSeconds * 1000;
+        this.store.set(key, { value: String(current), expiresAt });
+        return current;
+      };
+      const accountCount = increment(accountKey);
+      const sourceCount = increment(sourceKey);
+      return [
+        accountCount <= accountLimit && sourceCount <= sourceLimit ? 1 : 0,
+        accountCount,
+        sourceCount,
+        await this.ttl(accountKey),
+      ];
+    }
 
     const keys = args.slice(0, numKeys).map(String);
     const argv = args.slice(numKeys);

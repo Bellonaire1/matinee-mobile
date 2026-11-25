@@ -45,6 +45,29 @@ redis.call('SET', tokenKey, tokenPayload, 'EX', ttl)
 return {1, "OK"}
 `;
 
+/** Atomically increments per-account and per-source login counters with expiry. */
+export const STAFF_LOGIN_RATE_LIMIT_LUA = `
+local accountCount = redis.call('INCR', KEYS[1])
+if accountCount == 1 then
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+
+local sourceCount = redis.call('INCR', KEYS[2])
+if sourceCount == 1 then
+  redis.call('EXPIRE', KEYS[2], tonumber(ARGV[1]))
+end
+
+local accountAllowed = accountCount <= tonumber(ARGV[2])
+local sourceAllowed = sourceCount <= tonumber(ARGV[3])
+local ttl = redis.call('TTL', KEYS[1])
+if ttl < 0 then ttl = tonumber(ARGV[1]) end
+
+if accountAllowed and sourceAllowed then
+  return {1, accountCount, sourceCount, ttl}
+end
+return {0, accountCount, sourceCount, ttl}
+`;
+
 export const RELEASE_HOLD_LUA = `
 local numSeatKeys = #KEYS - 1
 local tokenKey = KEYS[#KEYS]

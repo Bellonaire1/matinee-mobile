@@ -107,6 +107,8 @@ model User {
   phone           String?
   fullName        String?
   role            Role              @default(CUSTOMER)
+  passwordHash    String?           @map("password_hash")
+  authVersion     Int               @default(1) @map("auth_version")
   createdAt       DateTime          @default(now()) @map("created_at")
   updatedAt       DateTime          @updatedAt @map("updated_at")
 
@@ -399,4 +401,3 @@ model ProcessedWebhookEvent {
   @@index([provider, eventType])
   @@map("processed_webhook_events")
 }
-
