@@ -8,8 +8,8 @@ Matinee is an independent cinema ticket booking mobile application engineered fo
 
 ```
 matinee-mobile/
-├── app/                  # Mobile application source (Expo / React Native / TypeScript) [To be configured]
-├── server/               # Backend API service (Node.js / Express / TypeScript) [To be configured]
+├── app/                  # Mobile application source (Expo / React Native / TypeScript)
+├── server/               # Backend API service (Node.js / Express / TypeScript)
 ├── docs/                 # Product, design, and architecture documentation
 │   ├── product-overview.md
 │   ├── screen-inventory.md
@@ -17,7 +17,7 @@ matinee-mobile/
 │   └── decisions/
 │       ├── 0001-technology-stack.md
 │       └── 0002-booking-invariants-and-concurrency.md
-├── load-tests/           # Concurrency and performance test suites (k6) [To be configured]
+├── load-tests/           # Concurrency and performance test suites (k6)
 └── .gitignore
 ```
 
@@ -35,7 +35,32 @@ matinee-mobile/
 
 ## Project Status
 
-- **Task M01 Completed**: Project setup, Git initialization, design tokens, component specifications, and architecture decisions established.
-- **Git Repository**: Initialized locally (independent, no remote configured).
-- **Backend Endpoints**: NONE currently implemented.
-- **Dependencies**: Not yet installed (pending stack approval).
+- **Task M05.17B Checkpoint**: Presentation polish, staging integration, and evidence review completed locally; changes remain uncommitted pending approval.
+- **Git Repository**: [https://github.com/Bellonaire1/matinee-mobile](https://github.com/Bellonaire1/matinee-mobile)
+- **Live Staging API**: `https://matinee-staging-api.onrender.com/api/v1`
+- **Mobile Build**: Android preview APK, version `1.0.0 (6)`, EAS build `dc0226bb-5b50-48a4-aa61-534209f38052` ([build details](https://expo.dev/accounts/bellonaire/projects/matinee/builds/dc0226bb-5b50-48a4-aa61-534209f38052), [APK](https://expo.dev/artifacts/eas/5LC_Rh3SwFDTZX3_jpGS4aoFqLgUSX-YgDQQqZie2uM.apk)).
+- **Backend Architecture**: Express.js with PostgreSQL (Neon serverless) and Redis hold engine (Render Redis).
+- **Verified Staging Flow**: A real four-seat Android reservation was independently verified against staging PostgreSQL. The booking remains `PENDING` and tickets remain `PENDING_PAYMENT` because payments are disabled.
+- **Admission Safety**: Unpaid tickets do not receive a valid admission QR; no entry should be implied until payment succeeds.
+- **Graduation Gaps**: Signed QR generation/scanning, refunds ledger, waiting-room live updates, background jobs, sandbox payment/webhook verification, Figma exports, demonstration video, and LinkedIn submission remain incomplete or evidence-pending.
+
+---
+
+## Local Development & Testing
+
+### Mobile App (`app/`)
+```bash
+cd app
+npm install
+npm run typecheck      # TypeScript compilation check
+npm run test:seats     # Seat selection QA test harness (97/97 tests)
+npm run test:checkout  # Checkout simulation invariant harness
+```
+
+### Backend Server (`server/`)
+```bash
+cd server
+npm install
+npx tsc --noEmit       # TypeScript compilation check
+npm test               # Vitest unit & integration test suites
+```

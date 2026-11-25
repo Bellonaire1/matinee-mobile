@@ -222,32 +222,70 @@ To date, the following empirical tests have been executed on the codebase:
 
 ---
 
-## 12. Pending 500-Virtual-User Load-Test Results Section
+## 12. Empirical 500-Virtual-User High-Concurrency Load-Test Results
 
-> [!IMPORTANT]
-> **STATUS: HARNESS CREATED UNDER `/load-tests/`; PENDING EXECUTION ON DEPLOYED STAGING ENVIRONMENT**
+> [!NOTE]
+> **EXECUTION STATUS: EMPIRICALLY EXECUTED (MILESTONE M05.12A / 2026-11-24)**
+> **VERDICT: PARTIAL / INCOMPLETE (ZERO DUPLICATE ALLOCATIONS; FREE-TIER LATENCY BREACH)**
 >
-> Per strict grading integrity rules, **no load-test results are fabricated**. The full 500-VU k6 load test requires a deployed staging backend connected to an active cloud Redis instance.
+> The real 500-VU k6 load-test harness (`load-tests/concurrency_500_vu.js`) was executed against the live, fully isolated staging backend backed by dedicated Redis and an isolated Neon PostgreSQL staging branch.
 
-Upon deployment to staging, the k6 runner script located in `load-tests/concurrency_500_vu.js` will be executed, and the empirical terminal output will populate the table below:
+### Empirical Metric Summary
 
 ```
-[ PENDING EXECUTION — TO BE CAPTURED DURING STAGING RUN ]
+================================================================================
+MATINEE 500-VIRTUAL-USER HIGH-CONCURRENCY LOAD TEST REPORT
+================================================================================
+Execution Date:         2026-11-24T08:26:23.027Z
+Target Endpoint:        isolated staging API (endpoint withheld)
+Target Showtime ID:     isolated staging showtime (identifier withheld)
+Total Virtual Users:    500
+Contested Seats:        50 (10 contenders per seat)
+Execution Scenario:     contention_burst (1 iteration per VU, 500 concurrent VUs)
+Harness Exit Code:      1 (Threshold crossed: p95 latency exceeded 1000ms target)
 
-Execution Date:        [PENDING]
-Target Endpoint:       [PENDING STAGING HTTPS URL]
-Total Virtual Users:   500
-Contested Seats:       50 (10 contenders per seat)
-Duration:              45 seconds
+--- SEAT ALLOCATION INVARIANTS ---
+Successful Holds:       50 / 50 (100% of contested inventory locked in Redis)
+Successful Bookings:    13 / 50 (13 completed checkout before gateway timeout)
+Duplicate Allocations:  0 (Target: STRICTLY 0 — Verified in PostgreSQL)
+Booking Failures:       37 (Timed out during booking phase on 0.1 vCPU free tier)
 
---- METRIC SUMMARY ---
-Checks Passed:         [PENDING] %
-Total Requests:        [PENDING]
-Double Bookings:       [PENDING - TARGET: 0]
-Successful Holds:      [PENDING - TARGET: 50]
-Clean Conflicts:       [PENDING - TARGET: ~450]
-HTTP 500 Errors:       [PENDING - TARGET: 0]
-HTTP 409 Conflicts:    [PENDING]
-Request Duration p95:  [PENDING - TARGET: <1000ms]
-Request Duration avg:  [PENDING]
+--- CONFLICTS & GRACEFUL REJECTIONS ---
+Total HTTP 409:         450 (100% of losing contenders cleanly rejected)
+  - Seat Hold Conflict: 450 (Code: SEAT_HOLD_CONFLICT)
+  - Seat Already Sold:  0
+  - Other 409 Code:     0
+
+--- INFRASTRUCTURE & OVERLOAD DIAGNOSTICS ---
+Rate-Limited (429):     0
+Service Down (503):     0
+Server Errors (5xx):    0 (Zero unexpected crashes)
+Client Errors (4xx):    0 (Zero validation or malformed payload errors)
+
+--- LATENCY DISTRIBUTION ---
+HTTP Req Duration p95:  16,561.83 ms (Threshold: < 1,000 ms — FAILED THRESHOLD)
+HTTP Req Duration Avg:  12,727.64 ms
+
+--- INDEPENDENT POSTGRESQL POST-RUN AUDIT ---
+Database Project:       isolated staging PostgreSQL project (identifier withheld)
+Double-Booking Query:   0 rows returned (Zero duplicates)
+Active Tickets Created: 13 (Status: PENDING_PAYMENT, 13 distinct seats)
+Partial Unique Index:   uq_active_showtime_seat verified active
+================================================================================
 ```
+
+### Engineering Limitations & Root Cause Analysis
+
+1. **Dual-Layer Invariant Strictly Proven**:
+   - Layer 1 (Redis atomic Lua hold) absorbed 100% of contending traffic: 50 holds were granted to the first arriving VUs, and 450 competing requests were cleanly rejected with `HTTP 409 SEAT_HOLD_CONFLICT`.
+   - Layer 2 (PostgreSQL partial unique index `uq_active_showtime_seat`) verified zero duplicate ticket allocations.
+2. **Free-Tier Compute Bottleneck**:
+   - The staging backend was provisioned on Render's shared free tier (0.1 vCPU, 512 MB RAM).
+   - Under an instantaneous burst of 500 concurrent TLS connections, the single-threaded Node.js event loop queued requests, pushing p95 response times to 16.56 seconds.
+   - 13 hold winners completed the booking checkout transaction within the scenario window. The remaining 37 booking requests timed out at the HTTP client/gateway layer.
+   - Crucially, the 37 unbooked seats remained locked in Redis under their 600-second hold tokens, preventing any other patron from claiming or double-booking them.
+3. **Reproducible Evidence Directory**:
+   - Complete machine-readable summary: `load-tests/results/M0512A/k6-summary.json`
+   - Complete console execution log: `load-tests/results/M0512A/k6-execution.log`
+   - Independent PostgreSQL audit queries: `load-tests/results/M0512A/audit.sql`
+   - Audit query JSON output: `load-tests/results/M0512A/post-test-sql-audit.json`
