@@ -105,16 +105,22 @@ export interface DiscoveryResponse<T> {
 }
 
 // Configuration & Feature Flags
-const DEFAULT_API_BASE_URL = 'http://10.0.2.2:3000/api/v1'; // Android emulator localhost alias
+const DEFAULT_API_BASE_URL = 'https://matinee-staging-api.onrender.com/api/v1';
 export const API_BASE_URL =
-  process.env.EXPO_PUBLIC_API_URL ||
-  (typeof window !== 'undefined' && window.location?.origin
-    ? `${window.location.origin}/api/v1`
-    : DEFAULT_API_BASE_URL);
+  process.env.EXPO_PUBLIC_API_URL || DEFAULT_API_BASE_URL;
 
-// Feature flag: set EXPO_PUBLIC_USE_LIVE_API="true" to enable live network discovery
+// Presentation-only artwork for the seeded staging benchmark movie. The API
+// intentionally owns the real movie ID and booking data; this fills only null
+// artwork fields until staging metadata is populated.
+export const STAGING_DUNE_ARTWORK = {
+  posterUrl: 'https://image.tmdb.org/t/p/w500/6izwz7rsy95ARzTR3poZ8H6c5pp.jpg',
+  backdropUrl: 'https://image.tmdb.org/t/p/w1280/eZ239CUp1d6OryZEBPnO2n87gMG.jpg',
+};
+
+// Feature flag: set EXPO_PUBLIC_USE_LIVE_API="true" or when EXPO_PUBLIC_API_URL is configured
 export const IS_LIVE_API_ENABLED =
-  process.env.EXPO_PUBLIC_USE_LIVE_API?.trim().toLowerCase() === 'true';
+  process.env.EXPO_PUBLIC_USE_LIVE_API?.trim().toLowerCase() === 'true' ||
+  Boolean(process.env.EXPO_PUBLIC_API_URL);
 
 const REQUEST_TIMEOUT_MS = 3500;
 
@@ -122,13 +128,16 @@ const REQUEST_TIMEOUT_MS = 3500;
  * Maps a BackendMovie into the mobile UI's Movie format.
  */
 export function mapBackendMovieToUiMovie(bm: BackendMovie): Movie {
+  const presentationArtwork =
+    bm.id === 'mov-staging-dune' ? STAGING_DUNE_ARTWORK : undefined;
+
   return {
     id: bm.id,
     title: bm.title,
     tagline: bm.tagline || '',
     synopsis: bm.synopsis,
-    posterUrl: bm.posterUrl || '',
-    backdropUrl: bm.backdropUrl || '',
+    posterUrl: bm.posterUrl || presentationArtwork?.posterUrl || '',
+    backdropUrl: bm.backdropUrl || presentationArtwork?.backdropUrl || '',
     rating: bm.rating ? Number(bm.rating) : 8.5,
     votes: bm.votesCount ? `${bm.votesCount.toLocaleString()} votes` : '1.2k votes',
     runtime: `${bm.runtime}m`,
@@ -353,6 +362,82 @@ export const discoveryApi = {
     } catch (err: any) {
       return {
         data: LAGOS_CINEMAS,
+        source: 'mock_fallback',
+        fallbackReason: `Network error: ${err.message}`,
+      };
+    }
+  },
+
+  /**
+   * Fetches showtimes for a specific cinema and optional movie.
+   */
+  async getShowtimes(
+    cinemaId: string,
+    options: { movieId?: string; date?: string } = {}
+  ): Promise<DiscoveryResponse<BackendShowtime[]>> {
+    if (!IS_LIVE_API_ENABLED) {
+      return {
+        data: [],
+        source: 'mock_fallback',
+        fallbackReason: 'Live API disabled',
+      };
+    }
+
+    try {
+      const queryParams = new URLSearchParams();
+      if (options.movieId) queryParams.set('movieId', options.movieId);
+      if (options.date) queryParams.set('date', options.date);
+
+      const qs = queryParams.toString();
+      const url = `${API_BASE_URL}/cinemas/${encodeURIComponent(cinemaId)}/showtimes${qs ? `?${qs}` : ''}`;
+      const response = await fetchWithTimeout(url);
+
+      if (!response.ok) {
+        throw new Error(`Backend returned status ${response.status}`);
+      }
+
+      const body = await response.json();
+      return {
+        data: body.data || [],
+        source: 'live',
+      };
+    } catch (err: any) {
+      return {
+        data: [],
+        source: 'mock_fallback',
+        fallbackReason: `Network error: ${err.message}`,
+      };
+    }
+  },
+
+  /**
+   * Fetches real seats layout and availability status for a showtime.
+   */
+  async getShowtimeSeats(showtimeId: string): Promise<DiscoveryResponse<any>> {
+    if (!IS_LIVE_API_ENABLED) {
+      return {
+        data: null,
+        source: 'mock_fallback',
+        fallbackReason: 'Live API disabled',
+      };
+    }
+
+    try {
+      const url = `${API_BASE_URL}/showtimes/${encodeURIComponent(showtimeId)}/seats`;
+      const response = await fetchWithTimeout(url);
+
+      if (!response.ok) {
+        throw new Error(`Backend returned status ${response.status}`);
+      }
+
+      const body = await response.json();
+      return {
+        data: body.data,
+        source: 'live',
+      };
+    } catch (err: any) {
+      return {
+        data: null,
         source: 'mock_fallback',
         fallbackReason: `Network error: ${err.message}`,
       };

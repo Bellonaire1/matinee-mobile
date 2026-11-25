@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { View, StyleSheet, ScrollView } from 'react-native';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
@@ -8,12 +8,14 @@ import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { TICKETS_GUEST_INFO } from '@/data/discoveryEngine';
+import { getLastSessionBooking, BookingResult, BookingTicketItem } from '@/api/checkoutApi';
 import { colors } from '@/theme/colors';
 import { spacing } from '@/theme/spacing';
 import { radii } from '@/theme/radii';
 
 export default function TicketsScreen() {
   const router = useRouter();
+  const [activeBooking] = useState<BookingResult | null>(() => getLastSessionBooking());
 
   return (
     <ScreenContainer>
@@ -30,6 +32,84 @@ export default function TicketsScreen() {
             {TICKETS_GUEST_INFO.headerSubtitle}
           </Text>
         </View>
+
+        {/* Real Staging Booking Card (if an order was placed in this session) */}
+        {activeBooking && (
+          <Card variant="surface" padding="base" style={styles.bookingCard}>
+            <View style={styles.badgeRowBetween}>
+              <Badge label="STAGING RESERVATION" variant="status" size="sm" />
+              <Badge label="PENDING_PAYMENT" variant="highlight" size="sm" />
+            </View>
+
+            <View style={styles.bookingHeaderRow}>
+              <Ionicons name="film-outline" size={24} color={colors.primary} />
+              <View style={styles.bookingHeaderInfo}>
+                <Text variant="heading2" color="textPrimary">
+                  Staging Ticket Order
+                </Text>
+                <Text variant="caption" color="textSecondary">
+                  Ref: {activeBooking.bookingReference}
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.ticketDetailsBox}>
+              <View style={styles.detailRow}>
+                <Text variant="caption" color="textSecondary">Showtime ID:</Text>
+                <Text variant="caption" color="textPrimary" style={styles.boldText}>
+                  {activeBooking.showtimeId}
+                </Text>
+              </View>
+              <View style={styles.detailRow}>
+                <Text variant="caption" color="textSecondary">Total Amount:</Text>
+                <Text variant="caption" color="primary" style={styles.boldText}>
+                  &#8358;{(activeBooking.totalKobo / 100).toLocaleString('en-NG')}
+                </Text>
+              </View>
+              <View style={styles.detailRow}>
+                <Text variant="caption" color="textSecondary">Order Status:</Text>
+                <Text variant="caption" color="highlight" style={styles.boldText}>
+                  {activeBooking.status}
+                </Text>
+              </View>
+            </View>
+
+            {/* Itemized Tickets List */}
+            <View style={styles.ticketsSection}>
+              <Text variant="caption" color="textSecondary" style={styles.sectionHeader}>
+                ALLOCATED TICKETS ({activeBooking.tickets?.length || 0}):
+              </Text>
+              {activeBooking.tickets && activeBooking.tickets.length > 0 ? (
+                activeBooking.tickets.map((t: BookingTicketItem) => (
+                  <View key={t.id} style={styles.ticketItemRow}>
+                    <Ionicons name="ticket-outline" size={16} color={colors.highlight} />
+                    <View style={styles.ticketItemCol}>
+                      <Text variant="caption" color="textPrimary" style={styles.boldText}>
+                        Seat: {t.seatNumber || t.seatId.replace('-', '')}
+                      </Text>
+                      <Text variant="caption" color="textSecondary" style={styles.ticketCodeText}>
+                        Ticket status: {t.status} &bull; Tier: {t.tier}
+                      </Text>
+                    </View>
+                  </View>
+                ))
+              ) : null}
+            </View>
+
+            {/* Truthful Staging Notice */}
+            <View style={styles.previewNoticeBox}>
+              <Ionicons name="information-circle-outline" size={18} color={colors.highlight} />
+              <View style={styles.noticeTextCol}>
+                <Text variant="caption" color="textPrimary" style={styles.noticeTitle}>
+                  PAYMENT_ENABLED=false &bull; PENDING PAYMENT
+                </Text>
+                <Text variant="caption" color="textSecondary" style={styles.noticeMessage}>
+                  This reservation exists in the staging PostgreSQL database. Because payment processing is disabled on staging, tickets remain in PENDING_PAYMENT status and no active entry QR code is issued.
+                </Text>
+              </View>
+            </View>
+          </Card>
+        )}
 
         {/* Guest Empty State Card */}
         <Card variant="surface" padding="base" style={styles.emptyCard}>
@@ -106,6 +186,64 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingVertical: spacing.xl,
     paddingHorizontal: spacing.base,
+  },
+  bookingCard: {
+    marginBottom: spacing.base,
+    borderWidth: 1,
+    borderColor: 'rgba(76, 175, 80, 0.4)',
+  },
+  badgeRowBetween: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: spacing.sm,
+  },
+  bookingHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    marginBottom: spacing.base,
+  },
+  bookingHeaderInfo: {
+    flex: 1,
+  },
+  ticketDetailsBox: {
+    backgroundColor: colors.elevated,
+    borderRadius: radii.sm,
+    padding: spacing.sm,
+    marginBottom: spacing.base,
+    gap: 6,
+  },
+  detailRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  boldText: {
+    fontWeight: '700',
+  },
+  ticketsSection: {
+    marginBottom: spacing.base,
+  },
+  sectionHeader: {
+    fontWeight: '700',
+    marginBottom: spacing.xs,
+    letterSpacing: 0.5,
+  },
+  ticketItemRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    paddingVertical: 6,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
+  },
+  ticketItemCol: {
+    flex: 1,
+  },
+  ticketCodeText: {
+    fontSize: 11,
+    marginTop: 2,
   },
   badgeRow: {
     marginBottom: spacing.sm,

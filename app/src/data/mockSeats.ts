@@ -51,7 +51,30 @@ export function getShowtimeStartingPriceLabel(baseKobo: number = APPROVED_BASE_P
 }
 
 // Generates a verified auditorium layout containing exactly 320 unique seats (20 rows x 16 columns)
-export function generateAuditoriumLayout(basePriceKobo: number = APPROVED_BASE_PRICE_KOBO): AuditoriumLayout {
+export function generateAuditoriumLayout(
+  basePriceKobo: number = APPROVED_BASE_PRICE_KOBO,
+  auditoriumPrefix?: string,
+  backendSeats?: Array<{
+    id: string;
+    seatNumber: string;
+    row: string;
+    column: number;
+    tier: string;
+    isAccessible?: boolean;
+    isCouple?: boolean;
+    couplePartnerId?: string | null;
+    status: 'AVAILABLE' | 'HELD' | 'SOLD';
+    priceKobo?: number;
+  }>
+): AuditoriumLayout {
+  // Build lookup index if live backend seats are supplied
+  const backendSeatMap = new Map<string, any>();
+  if (backendSeats && backendSeats.length > 0) {
+    for (const bs of backendSeats) {
+      backendSeatMap.set(bs.id, bs);
+      backendSeatMap.set(bs.seatNumber, bs);
+    }
+  }
   // Tier pricing in kobo:
   // Standard base: ₦7,000 = 700,000 kobo
   // Accessible: same as standard (₦7,000 = 700,000 kobo)
@@ -134,7 +157,9 @@ export function generateAuditoriumLayout(basePriceKobo: number = APPROVED_BASE_P
 
     // 16 seats per row: [1..4] [Aisle] [5..12] [Aisle] [13..16]
     for (let col = 1; col <= 16; col++) {
-      const id = `${rowLetter}-${col}`;
+      const displayLabel = `${rowLetter}${col}`;
+      const defaultId = `${rowLetter}-${col}`;
+      const id = auditoriumPrefix ? `${auditoriumPrefix}-${rowLetter}-${col}` : defaultId;
 
       // Wheelchair allocation: exactly 4 seats at the outer edges of Row A
       const isAccessible = rowLetter === 'A' && (col === 1 || col === 2 || col === 15 || col === 16);
@@ -143,7 +168,10 @@ export function generateAuditoriumLayout(basePriceKobo: number = APPROVED_BASE_P
       // Couple seats pair adjacent columns (1-2, 3-4, 5-6, 7-8, etc.)
       let couplePartnerId: string | undefined;
       if (isCouple) {
-        couplePartnerId = col % 2 === 1 ? `${rowLetter}-${col + 1}` : `${rowLetter}-${col - 1}`;
+        const partnerCol = col % 2 === 1 ? col + 1 : col - 1;
+        couplePartnerId = auditoriumPrefix
+          ? `${auditoriumPrefix}-${rowLetter}-${partnerCol}`
+          : `${rowLetter}-${partnerCol}`;
       }
 
       // Determine effective tier for seat
@@ -153,13 +181,16 @@ export function generateAuditoriumLayout(basePriceKobo: number = APPROVED_BASE_P
       }
 
       let status: SeatStatus = 'available';
-      if (soldSeatIds.has(id)) {
+      const liveSeat = backendSeatMap.get(id) || backendSeatMap.get(displayLabel);
+      if (liveSeat) {
+        status = liveSeat.status === 'SOLD' ? 'sold' : liveSeat.status === 'HELD' ? 'held' : 'available';
+      } else if (soldSeatIds.has(defaultId) || soldSeatIds.has(id)) {
         status = 'sold';
-      } else if (heldSeatIds.has(id)) {
+      } else if (heldSeatIds.has(defaultId) || heldSeatIds.has(id)) {
         status = 'held';
       }
 
-      const priceKobo = tierPricing[effectiveTier];
+      const priceKobo = liveSeat?.priceKobo || tierPricing[effectiveTier];
 
       const seat: SeatModel = {
         id,

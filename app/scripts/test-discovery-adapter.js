@@ -75,7 +75,7 @@ it('Mock catalog movies are available as immediate fallback', () => {
   assert.ok(ALL_MOVIES.length >= 4);
   assert.ok(MOCK_NOW_SHOWING_MOVIES.length >= 3);
   assert.ok(MOCK_COMING_SOON_MOVIES.length >= 1);
-  assert.strictEqual(LAGOS_CINEMAS.length, 4);
+  assert.strictEqual(LAGOS_CINEMAS.length, 5);
 });
 
 console.log('\nSUITE 2: Backend-to-Mobile Mapping Invariants');

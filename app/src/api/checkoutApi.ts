@@ -378,40 +378,150 @@ class SimulatedCheckoutEngine {
 export const simulatedCheckoutEngine = new SimulatedCheckoutEngine();
 
 // -----------------------------------------------------------------------------
-// Future API Mode (Contract Preparation Only - Inactive by default)
+// Environment-Gated Staging Mode & Real API Adapter (Milestone M05.13)
 // -----------------------------------------------------------------------------
 
-// STRICT SAFETY LOCK: Future API mode cannot be enabled solely via a public env flag.
-// Live mutations are locked in Milestone M05.6; separate authorization and backend infrastructure
-// verification are strictly required before live gateway mode can be activated.
-const USE_LIVE_CHECKOUT = false;
-const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || 'http://localhost:4000/api/v1';
+export const API_BASE_URL =
+  process.env.EXPO_PUBLIC_API_URL || 'https://matinee-staging-api.onrender.com/api/v1';
+
+export const IS_LIVE_CHECKOUT_ENABLED =
+  process.env.EXPO_PUBLIC_USE_LIVE_CHECKOUT?.trim().toLowerCase() === 'true' ||
+  Boolean(process.env.EXPO_PUBLIC_API_URL?.includes('matinee-staging-api.onrender.com'));
+
+export class ApiError extends Error {
+  code?: string;
+  status: number;
+  data?: any;
+
+  constructor(message: string, status: number, code?: string, data?: any) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+    this.data = data;
+  }
+}
 
 export async function apiAcquireHold(
   showtimeId: string,
   seatIds: string[],
   idempotencyKey?: string
 ): Promise<HoldResult> {
-  if (!USE_LIVE_CHECKOUT) {
-    throw new Error('Live checkout API is strictly locked in Milestone M05.6. Use offline demo mode.');
-  }
-
-  const response = await fetch(`${API_BASE_URL}/showtimes/${encodeURIComponent(showtimeId)}/holds`, {
+  const url = `${API_BASE_URL}/showtimes/${encodeURIComponent(showtimeId)}/holds`;
+  const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      Accept: 'application/json',
       ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
     },
     body: JSON.stringify({ seatIds }),
   });
 
   if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err.message || `Hold acquisition failed with status ${response.status}`);
+    const errBody = await response.json().catch(() => ({}));
+    const code = errBody.code || errBody.error?.code || 'HOLD_FAILED';
+    const message = errBody.message || errBody.error?.message || `Hold acquisition failed with HTTP ${response.status}`;
+    throw new ApiError(message, response.status, code, errBody);
   }
 
-  const data = await response.json();
-  return { ...data.data, isSimulated: false };
+  const json = await response.json();
+  const data = json.data;
+  return {
+    holdToken: data.holdToken,
+    showtimeId: data.showtimeId,
+    seats: data.seats || [],
+    totalSeats: data.totalSeats || (data.seats ? data.seats.length : seatIds.length),
+    totalPriceKobo: data.totalPriceKobo || 0,
+    expiresAt: data.expiresAt,
+    expiresInSeconds: data.expiresInSeconds || INITIAL_HOLD_SECONDS,
+    extensionCount: data.extensionCount || 0,
+    isSimulated: false,
+  };
+}
+
+export async function apiGetHold(holdToken: string): Promise<HoldResult> {
+  const url = `${API_BASE_URL}/holds`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+      'X-Hold-Token': holdToken,
+    },
+  });
+
+  if (!response.ok) {
+    const errBody = await response.json().catch(() => ({}));
+    const code = errBody.code || errBody.error?.code || 'GET_HOLD_FAILED';
+    const message = errBody.message || `Hold lookup failed with HTTP ${response.status}`;
+    throw new ApiError(message, response.status, code, errBody);
+  }
+
+  const json = await response.json();
+  const data = json.data;
+  return {
+    holdToken: data.holdToken || holdToken,
+    showtimeId: data.showtimeId,
+    seats: data.seats || [],
+    totalSeats: data.totalSeats || (data.seats ? data.seats.length : 0),
+    totalPriceKobo: data.totalPriceKobo || 0,
+    expiresAt: data.expiresAt,
+    expiresInSeconds: data.expiresInSeconds || 0,
+    extensionCount: data.extensionCount || 0,
+    isSimulated: false,
+  };
+}
+
+export async function apiReleaseHold(
+  holdToken: string
+): Promise<{ releasedSeatsCount: number; message: string }> {
+  const url = `${API_BASE_URL}/holds`;
+  const response = await fetch(url, {
+    method: 'DELETE',
+    headers: {
+      Accept: 'application/json',
+      'X-Hold-Token': holdToken,
+    },
+  });
+
+  if (!response.ok) {
+    const errBody = await response.json().catch(() => ({}));
+    const code = errBody.code || 'RELEASE_HOLD_FAILED';
+    const message = errBody.message || `Hold release failed with HTTP ${response.status}`;
+    throw new ApiError(message, response.status, code, errBody);
+  }
+
+  const json = await response.json();
+  return json.data || { releasedSeatsCount: 0, message: 'Hold released' };
+}
+
+export async function apiHeartbeatHold(
+  holdToken: string
+): Promise<{ holdToken: string; expiresInSeconds: number; extensionCount: number; message: string }> {
+  const url = `${API_BASE_URL}/holds/heartbeat`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'X-Hold-Token': holdToken,
+    },
+  });
+
+  if (!response.ok) {
+    const errBody = await response.json().catch(() => ({}));
+    const code = errBody.code || 'HEARTBEAT_FAILED';
+    const message = errBody.message || `Hold extension failed with HTTP ${response.status}`;
+    throw new ApiError(message, response.status, code, errBody);
+  }
+
+  const json = await response.json();
+  const data = json.data;
+  return {
+    holdToken: data.holdToken || holdToken,
+    expiresInSeconds: data.expiresInSeconds || EXTENSION_HOLD_SECONDS,
+    extensionCount: data.extensionCount || 1,
+    message: data.message || 'Hold successfully extended by 5 minutes',
+  };
 }
 
 export async function apiCreateBooking(params: {
@@ -424,14 +534,12 @@ export async function apiCreateBooking(params: {
   holdToken: string;
   idempotencyKey: string;
 }): Promise<BookingResult> {
-  if (!USE_LIVE_CHECKOUT) {
-    throw new Error('Live checkout API is inactive in offline demo mode');
-  }
-
-  const response = await fetch(`${API_BASE_URL}/bookings`, {
+  const url = `${API_BASE_URL}/bookings`;
+  const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      Accept: 'application/json',
       'Idempotency-Key': params.idempotencyKey,
       'X-Hold-Token': params.holdToken,
     },
@@ -446,12 +554,42 @@ export async function apiCreateBooking(params: {
   });
 
   if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error(err.message || `Booking creation failed with status ${response.status}`);
+    const errBody = await response.json().catch(() => ({}));
+    const code = errBody.code || errBody.error?.code || 'BOOKING_FAILED';
+    const message = errBody.message || errBody.error?.message || `Booking creation failed with HTTP ${response.status}`;
+    throw new ApiError(message, response.status, code, errBody);
   }
 
-  const data = await response.json();
-  return { ...data.data, isSimulated: false };
+  const json = await response.json();
+  const data = json.data;
+  const tickets: BookingTicketItem[] = (data.tickets || []).map((t: any) => ({
+    id: t.id,
+    seatId: t.seatId,
+    seatNumber: t.seatNumber || (t.ticketCode ? t.ticketCode.split('-')[2] : t.seatId),
+    tier: t.tier,
+    priceKobo: t.priceKobo,
+    status: t.status,
+  }));
+
+  return {
+    id: data.id,
+    bookingReference: data.bookingReference,
+    showtimeId: data.showtimeId,
+    status: data.status,
+    totalKobo: data.totalKobo,
+    expiresAt: data.expiresAt || '',
+    tickets,
+    isSimulated: false,
+    idempotencyKey: params.idempotencyKey,
+  };
+}
+
+let lastSessionBooking: BookingResult | null = null;
+export function getLastSessionBooking(): BookingResult | null {
+  return lastSessionBooking;
+}
+export function setLastSessionBooking(booking: BookingResult | null): void {
+  lastSessionBooking = booking;
 }
 
 export async function apiInitializePayment(params: {
@@ -459,7 +597,7 @@ export async function apiInitializePayment(params: {
   holdToken?: string;
   email?: string;
 }): Promise<PaymentInitResult> {
-  if (!USE_LIVE_CHECKOUT) {
+  if (!IS_LIVE_CHECKOUT_ENABLED) {
     throw new Error('Live checkout API is inactive in offline demo mode');
   }
 
@@ -488,7 +626,7 @@ export async function apiGetPaymentStatus(params: {
   reference: string;
   holdToken?: string;
 }): Promise<PaymentStatusResult> {
-  if (!USE_LIVE_CHECKOUT) {
+  if (!IS_LIVE_CHECKOUT_ENABLED) {
     throw new Error('Live checkout API is inactive in offline demo mode');
   }
 

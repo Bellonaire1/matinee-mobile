@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback } from 'react';
+import React, { useState, useMemo, useCallback, useEffect } from 'react';
 import {
   View,
   StyleSheet,
@@ -18,6 +18,7 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { SeatMap } from '@/components/seat-map/SeatMap';
 import { getMovieById } from '@/data/mockMovies';
 import { LAGOS_CINEMAS } from '@/data/mockCinemas';
+import { discoveryApi, IS_LIVE_API_ENABLED } from '@/api/discoveryApi';
 import {
   generateAuditoriumLayout,
   SeatModel,
@@ -58,10 +59,37 @@ export default function SeatSelectionScreen() {
     return slots.find((s) => s.id === params.showtimeId);
   }, [cinema, movie, params.showtimeId]);
 
+  // Live staging seats state
+  const [liveSeats, setLiveSeats] = useState<any[] | null>(null);
+
+  useEffect(() => {
+    if (!params.showtimeId) return;
+    const isStaging = params.showtimeId.startsWith('shw-') || IS_LIVE_API_ENABLED;
+    if (isStaging) {
+      discoveryApi
+        .getShowtimeSeats(params.showtimeId)
+        .then((res) => {
+          if (res?.data?.seats && res.data.seats.length > 0) {
+            setLiveSeats(res.data.seats);
+          }
+        })
+        .catch((err) => {
+          console.warn('Could not fetch live showtime seats:', err);
+        });
+    }
+  }, [params.showtimeId]);
+
   // Derive auditorium layout using approved tier pricing model (Standard base: ₦7,000 = 700,000 kobo)
   const auditorium = useMemo(() => {
-    return generateAuditoriumLayout(APPROVED_BASE_PRICE_KOBO);
-  }, []);
+    const isStagingAuditorium =
+      params.showtimeId?.startsWith('shw-') || params.cinemaId === 'cin-staging-lekki';
+    const prefix = isStagingAuditorium ? 'aud-staging-main' : undefined;
+    return generateAuditoriumLayout(
+      APPROVED_BASE_PRICE_KOBO,
+      prefix,
+      liveSeats || undefined
+    );
+  }, [params.showtimeId, params.cinemaId, liveSeats]);
 
   // Local Selection State (Set of Seat IDs)
   const [selectedSeatIds, setSelectedSeatIds] = useState<Set<string>>(new Set());

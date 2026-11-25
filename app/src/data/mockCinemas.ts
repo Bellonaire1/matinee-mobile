@@ -72,6 +72,51 @@ export function generateDateRibbon(baseDate: Date = new Date()): DayOption[] {
 // Mock Lagos Cinemas catalog
 export const LAGOS_CINEMAS: Cinema[] = [
   {
+    id: 'cin-staging-lekki',
+    name: 'Filmhouse Cinemas Staging',
+    chain: 'Filmhouse',
+    neighborhood: 'Lekki Phase 1',
+    address: 'Plot 1, Staging Boulevard, Lekki, Lagos',
+    distanceKm: 2.5,
+    features: ['Laser IMAX', 'Signature VIP', 'Dolby Atmos'],
+    showtimesByMovie: {
+      'mov-staging-dune': [
+        {
+          id: 'shw-staging-smoke-01',
+          time: '18:00',
+          format: 'Standard 2D',
+          screen: 'Screen 1 (Laser IMAX Staging)',
+          price: 7000,
+          currency: '₦',
+          status: 'available',
+          seatsAvailable: 319,
+        },
+        {
+          id: 'shw-staging-loadtest-01',
+          time: '20:30',
+          format: 'Standard 2D',
+          screen: 'Screen 1 (Laser IMAX Staging)',
+          price: 7000,
+          currency: '₦',
+          status: 'available',
+          seatsAvailable: 307,
+        },
+      ],
+      'feat-1': [
+        {
+          id: 'shw-staging-loadtest-01',
+          time: '20:30',
+          format: 'Standard 2D',
+          screen: 'Screen 1 (Laser IMAX Staging)',
+          price: 7000,
+          currency: '₦',
+          status: 'available',
+          seatsAvailable: 307,
+        },
+      ],
+    },
+  },
+  {
     id: 'cin-lekki-imax',
     name: 'Filmhouse Cinemas IMAX',
     chain: 'Filmhouse',

@@ -44,6 +44,7 @@ const mockMoviesPath = path.resolve(__dirname, '../src/data/mockMovies.ts');
 const discoveryApiPath = path.resolve(__dirname, '../src/api/discoveryApi.ts');
 
 const { ALL_MOVIES } = loadTs(mockMoviesPath);
+const { mapBackendMovieToUiMovie, STAGING_DUNE_ARTWORK } = loadTs(discoveryApiPath);
 
 let testsPassed = 0;
 let testsTotal = 0;
@@ -137,7 +138,28 @@ async function runSuite() {
     });
   });
 
-  it('7. Cast members have no misleading stranger headshots', () => {
+  it('7. Staging Dune artwork fallback preserves the real movie ID', () => {
+    const stagingMovie = mapBackendMovieToUiMovie({
+      id: 'mov-staging-dune',
+      title: 'Dune: Part Two (Staging Benchmark)',
+      synopsis: 'Staging benchmark',
+      runtime: 166,
+      ageRating: '15',
+      releaseYear: 2026,
+      genres: ['Action'],
+      formats: ['IMAX'],
+      category: 'NOW_SHOWING',
+      isActive: true,
+      posterUrl: null,
+      backdropUrl: null,
+    });
+
+    assert.strictEqual(stagingMovie.id, 'mov-staging-dune');
+    assert.strictEqual(stagingMovie.posterUrl, STAGING_DUNE_ARTWORK.posterUrl);
+    assert.strictEqual(stagingMovie.backdropUrl, STAGING_DUNE_ARTWORK.backdropUrl);
+  });
+
+  it('8. Cast members have no misleading stranger headshots', () => {
     ALL_MOVIES.forEach((movie) => {
       assert.ok(Array.isArray(movie.cast) && movie.cast.length > 0, `Movie ${movie.title} has no cast`);
       movie.cast.forEach((actor) => {
@@ -149,7 +171,7 @@ async function runSuite() {
     });
   });
 
-  await itAsync('8. Verified network accessibility for all 16 TMDB assets (HEAD -> 200 OK)', async () => {
+  await itAsync('9. Verified network accessibility for all 16 TMDB assets (HEAD -> 200 OK)', async () => {
     let networkAvailable = true;
     try {
       await checkUrlStatus('https://image.tmdb.org/t/p/w500/6izwz7rsy95ARzTR3poZ8H6c5pp.jpg');
@@ -181,7 +203,7 @@ async function runSuite() {
     }
   });
 
-  it('9. Official TMDB logo asset exists and is valid PNG', () => {
+  it('10. Official TMDB logo asset exists and is valid PNG', () => {
     const logoPath = path.resolve(__dirname, '../assets/images/tmdb-logo.png');
     assert.ok(fs.existsSync(logoPath), 'TMDB logo asset missing at assets/images/tmdb-logo.png');
     const buf = fs.readFileSync(logoPath);
@@ -191,7 +213,7 @@ async function runSuite() {
     assert.ok(width > 0 && height > 0, `Invalid logo dimensions: ${width}x${height}`);
   });
 
-  it('10. Statutory TMDB non-endorsement notice and logo rendered in Profile and Movie Details', () => {
+  it('11. Statutory TMDB non-endorsement notice and logo rendered in Profile and Movie Details', () => {
     const profilePath = path.resolve(__dirname, '../src/app/(tabs)/profile.tsx');
     const movieDetailPath = path.resolve(__dirname, '../src/app/movie/[id].tsx');
     const requiredNotice = 'This product uses the TMDB API but is not endorsed or certified by TMDB.';

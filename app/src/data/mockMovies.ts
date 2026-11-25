@@ -414,6 +414,30 @@ export const MOCK_COMING_SOON_MOVIES: Movie[] = [
   },
 ];
 
+export const STAGING_DUNE_MOVIE: Movie = {
+  id: 'mov-staging-dune',
+  tmdbId: 693134,
+  title: 'Dune: Part Two (Staging Benchmark)',
+  tagline: 'Long live the fighters.',
+  synopsis:
+    'Synthetic load-test screening for 500-VU seat contention and zero double-booking verification.',
+  posterUrl: 'https://image.tmdb.org/t/p/w500/6izwz7rsy95ARzTR3poZ8H6c5pp.jpg',
+  backdropUrl: 'https://image.tmdb.org/t/p/w1280/eZ239CUp1d6OryZEBPnO2n87gMG.jpg',
+  rating: 8.8,
+  votes: '320k',
+  runtime: '2h 46m',
+  ageRating: '15',
+  releaseYear: '2026',
+  language: 'English',
+  genres: ['Action', 'Adventure', 'Sci-Fi'],
+  formats: ['STANDARD_2D', 'Laser IMAX'],
+  releaseDate: '2026-11-23',
+  director: 'Denis Villeneuve',
+  category: 'now_showing',
+  priceRange: APPROVED_MOVIE_STARTING_PRICE,
+  cast: [],
+};
+
 export const ALL_MOVIES: Movie[] = [
   MOCK_FEATURED_MOVIE,
   ...MOCK_NOW_SHOWING_MOVIES,
@@ -421,6 +445,7 @@ export const ALL_MOVIES: Movie[] = [
 ];
 
 export function getMovieById(id: string): Movie | undefined {
+  if (id === 'mov-staging-dune') return STAGING_DUNE_MOVIE;
   return ALL_MOVIES.find((m) => m.id === id);
 }
 

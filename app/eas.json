@@ -8,8 +8,12 @@
       "developmentClient": false,
       "android": {
         "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://matinee-staging-api.onrender.com/api/v1",
+        "EXPO_PUBLIC_USE_LIVE_API": "true",
+        "EXPO_PUBLIC_USE_LIVE_CHECKOUT": "true"
       }
     }
   }
 }
-

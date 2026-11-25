@@ -20,7 +20,6 @@ import { generateAuditoriumLayout, APPROVED_BASE_PRICE_KOBO } from '@/data/mockS
 import { formatSeatCount } from '@/data/seatSelectionEngine';
 import {
   validateCheckoutContext,
-  CHECKOUT_DEMO_DISCLAIMER,
   CHECKOUT_DEMO_SUBTEXT,
   DEMO_CHECKOUT_STATES,
   DemoCheckoutState,
@@ -34,6 +33,12 @@ import {
   INITIAL_HOLD_SECONDS,
   MAX_HOLD_LIFETIME_SECONDS,
   MAX_ALLOWED_EXTENSIONS,
+  IS_LIVE_CHECKOUT_ENABLED,
+  apiAcquireHold,
+  apiReleaseHold,
+  apiHeartbeatHold,
+  apiCreateBooking,
+  setLastSessionBooking,
 } from '@/api/checkoutApi';
 import { colors } from '@/theme/colors';
 import { spacing } from '@/theme/spacing';
@@ -48,6 +53,9 @@ export default function CheckoutPreviewScreen() {
     showtimeId?: string;
     seatIds?: string;
   }>();
+
+  // Environment-gated live staging mode indicator
+  const isLive = IS_LIVE_CHECKOUT_ENABLED;
 
   // Active demonstration modal state (static demos)
   const [activeDemoState, setActiveDemoState] = useState<DemoCheckoutState>('none');
@@ -67,7 +75,7 @@ export default function CheckoutPreviewScreen() {
   // Transactional simulation execution state
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [simulationResult, setSimulationResult] = useState<{
-    outcome: 'succeeded' | 'failed' | 'expired';
+    outcome: 'succeeded' | 'failed' | 'expired' | 'pending_payment';
     booking?: BookingResult;
     payment?: PaymentStatusResult;
     failureReason?: string;
@@ -75,9 +83,10 @@ export default function CheckoutPreviewScreen() {
   const [showResultModal, setShowResultModal] = useState<boolean>(false);
 
   // Stable session idempotency key across retries
-  const idempotencyKeyRef = useRef<string>(
+  const [idempotencyKey] = useState<string>(() =>
     `sim_idemp_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`
   );
+  const idempotencyKeyRef = useRef<string>(idempotencyKey);
 
   // Stable ref for the currently active hold token to ensure safe cleanup on unmount/back navigation
   const activeHoldTokenRef = useRef<string | null>(null);
@@ -85,8 +94,11 @@ export default function CheckoutPreviewScreen() {
 
   // Derive auditorium domain model with approved tier base pricing
   const auditorium = useMemo(() => {
-    return generateAuditoriumLayout(APPROVED_BASE_PRICE_KOBO);
-  }, []);
+    const isStagingAuditorium =
+      params.showtimeId?.startsWith('shw-') || params.cinemaId === 'cin-staging-lekki';
+    const prefix = isStagingAuditorium ? 'aud-staging-main' : undefined;
+    return generateAuditoriumLayout(APPROVED_BASE_PRICE_KOBO, prefix);
+  }, [params.showtimeId, params.cinemaId]);
 
   // Validate session context and recalculate estimates strictly from pure engine
   const validationResult = useMemo(() => {
@@ -110,7 +122,7 @@ export default function CheckoutPreviewScreen() {
     }));
   }, [validationResult]);
 
-  // Acquire simulated hold on mount
+  // Acquire hold on mount (live staging API or offline demo engine)
   useEffect(() => {
     isMountedRef.current = true;
     if (!validationResult.isValid) return;
@@ -119,35 +131,64 @@ export default function CheckoutPreviewScreen() {
     const seatIds = validationResult.selectionTotals.selectedSeats.map((s) => s.id);
     const totalPriceKobo = validationResult.selectionTotals.totalKobo;
 
-    simulatedCheckoutEngine
-      .acquireHold(showtimeId, seatIds, heldSeats, totalPriceKobo)
-      .then((hold) => {
-        if (!isMountedRef.current) {
-          // If component unmounted while acquireHold was pending, release immediately
-          simulatedCheckoutEngine.releaseHold(hold.holdToken).catch(() => {});
-          return;
-        }
-        activeHoldTokenRef.current = hold.holdToken;
-        setHoldResult(hold);
-        setSecondsRemaining(hold.expiresInSeconds);
-        setExtensionCount(hold.extensionCount);
-        setHoldExpired(false);
-      })
-      .catch((err) => {
-        if (!isMountedRef.current) return;
-        console.warn('Failed to acquire initial simulated hold:', err);
-      });
+    if (isLive) {
+      apiAcquireHold(showtimeId, seatIds, idempotencyKeyRef.current)
+        .then((hold) => {
+          if (!isMountedRef.current) {
+            apiReleaseHold(hold.holdToken).catch(() => { });
+            return;
+          }
+          activeHoldTokenRef.current = hold.holdToken;
+          setHoldResult(hold);
+          setSecondsRemaining(hold.expiresInSeconds);
+          setExtensionCount(hold.extensionCount);
+          setHoldExpired(false);
+          setHoldStatusMessage(null);
+        })
+        .catch((err: any) => {
+          if (!isMountedRef.current) return;
+          console.warn('Live hold acquisition failed:', err);
+          setHoldExpired(true);
+          setSecondsRemaining(0);
+          const msg =
+            err?.code === 'SEAT_HOLD_CONFLICT'
+              ? 'Seat(s) are currently held by another moviegoer. Please select different seats.'
+              : err?.message || 'Could not acquire live seat hold from staging server.';
+          setHoldStatusMessage(msg);
+        });
+    } else {
+      simulatedCheckoutEngine
+        .acquireHold(showtimeId, seatIds, heldSeats, totalPriceKobo)
+        .then((hold) => {
+          if (!isMountedRef.current) {
+            simulatedCheckoutEngine.releaseHold(hold.holdToken).catch(() => { });
+            return;
+          }
+          activeHoldTokenRef.current = hold.holdToken;
+          setHoldResult(hold);
+          setSecondsRemaining(hold.expiresInSeconds);
+          setExtensionCount(hold.extensionCount);
+          setHoldExpired(false);
+        })
+        .catch((err) => {
+          if (!isMountedRef.current) return;
+          console.warn('Failed to acquire initial simulated hold:', err);
+        });
+    }
 
     return () => {
       isMountedRef.current = false;
-      // Release simulated hold on unmount / navigation away safely via stable ref
       const tokenToRelease = activeHoldTokenRef.current;
       if (tokenToRelease) {
         activeHoldTokenRef.current = null;
-        simulatedCheckoutEngine.releaseHold(tokenToRelease).catch(() => {});
+        if (isLive) {
+          apiReleaseHold(tokenToRelease).catch(() => { });
+        } else {
+          simulatedCheckoutEngine.releaseHold(tokenToRelease).catch(() => { });
+        }
       }
     };
-  }, [validationResult.isValid]);
+  }, [validationResult.isValid, isLive]);
 
   // Hold countdown timer tick
   useEffect(() => {
@@ -173,7 +214,9 @@ export default function CheckoutPreviewScreen() {
     if (!currentToken || holdExpired || extensionCount >= MAX_ALLOWED_EXTENSIONS) return;
 
     try {
-      const res = await simulatedCheckoutEngine.extendHold(currentToken);
+      const res = isLive
+        ? await apiHeartbeatHold(currentToken)
+        : await simulatedCheckoutEngine.extendHold(currentToken);
       if (!isMountedRef.current) return;
       setSecondsRemaining(res.expiresInSeconds);
       setExtensionCount(res.extensionCount);
@@ -192,17 +235,17 @@ export default function CheckoutPreviewScreen() {
         }
       }, 4000);
     }
-  }, [holdResult, holdExpired, extensionCount]);
+  }, [holdResult, holdExpired, extensionCount, isLive]);
 
   // Clean back navigation releasing hold
   const handleBack = useCallback(() => {
     const tokenToRelease = activeHoldTokenRef.current;
     if (tokenToRelease) {
       activeHoldTokenRef.current = null;
-      simulatedCheckoutEngine.releaseHold(tokenToRelease).catch(() => {});
+      (isLive ? apiReleaseHold(tokenToRelease) : simulatedCheckoutEngine.releaseHold(tokenToRelease)).catch(() => { });
     }
     router.back();
-  }, [router]);
+  }, [router, isLive]);
 
   // Interactive Simulated Checkout Flow
   const handleExecuteSimulatedCheckout = useCallback(
@@ -308,6 +351,37 @@ export default function CheckoutPreviewScreen() {
     ]
   );
 
+  const handleExecuteLiveCheckout = useCallback(async () => {
+    if (!validationResult.isValid || holdExpired) return;
+    if (!customerEmail.trim() || !customerEmail.includes('@')) {
+      setEmailError('Please enter a valid customer email address.');
+      return;
+    }
+
+    setEmailError(undefined);
+    setIsProcessing(true);
+    try {
+      const booking = await apiCreateBooking({
+        showtimeId: validationResult.showtime.id,
+        seatIds: validationResult.selectionTotals.selectedSeats.map((seat) => seat.id),
+        contactEmail: customerEmail.trim(),
+        contactName: customerName.trim() || undefined,
+        totalPriceKobo: validationResult.selectionTotals.totalKobo,
+        holdToken: activeHoldTokenRef.current || holdResult?.holdToken || '',
+        idempotencyKey: idempotencyKeyRef.current,
+      });
+      activeHoldTokenRef.current = null;
+      setLastSessionBooking(booking);
+      setSimulationResult({ outcome: 'pending_payment', booking });
+      setShowResultModal(true);
+    } catch (err: any) {
+      setSimulationResult({ outcome: 'failed', failureReason: err?.message || 'Staging booking failed.' });
+      setShowResultModal(true);
+    } finally {
+      if (isMountedRef.current) setIsProcessing(false);
+    }
+  }, [validationResult, holdExpired, customerEmail, customerName, holdResult]);
+
   // Graceful Handling for Invalid or Missing Selection Parameters
   if (!validationResult.isValid) {
     return (
@@ -381,14 +455,14 @@ export default function CheckoutPreviewScreen() {
 
         <View style={styles.headerInfoCol}>
           <Text variant="heading2" color="textPrimary" numberOfLines={1}>
-            Checkout (Demo)
+            {isLive ? 'Staging Checkout' : 'Checkout (Demo)'}
           </Text>
           <Text variant="caption" color="textSecondary" numberOfLines={1}>
-            Offline Simulation &bull; Test Checkout
+            {isLive ? 'Live seat hold & booking' : 'Offline Simulation &bull; Test Checkout'}
           </Text>
         </View>
 
-        <Badge label="TEST MODE" variant="highlight" size="sm" />
+        <Badge label={isLive ? 'STAGING' : 'TEST MODE'} variant="highlight" size="sm" />
       </SafeAreaView>
 
       {/* Prominent Demo Disclaimer Banner */}
@@ -398,10 +472,12 @@ export default function CheckoutPreviewScreen() {
         </View>
         <View style={styles.bannerTextBox}>
           <Text variant="caption" color="textPrimary" style={styles.bannerTitle}>
-            TEST / DEMO MODE — NO REAL PAYMENT REQUIRED
+            {isLive ? 'STAGING MODE — PAYMENT DISABLED' : 'TEST / DEMO MODE — NO REAL PAYMENT REQUIRED'}
           </Text>
           <Text variant="caption" color="textSecondary" style={styles.bannerSubtext}>
-            {CHECKOUT_DEMO_SUBTEXT} Card transactions and tickets are simulated locally. No real money or live reservation records will be modified.
+            {isLive
+              ? 'Seats are held in Redis and reservations are written to staging PostgreSQL. Payment remains disabled; bookings stay pending.'
+              : `${CHECKOUT_DEMO_SUBTEXT} Card transactions and tickets are simulated locally. No real money or live reservation records will be modified.`}
           </Text>
         </View>
       </View>
@@ -558,10 +634,10 @@ export default function CheckoutPreviewScreen() {
                 seat.tier === 'vip'
                   ? 'rating'
                   : seat.tier === 'couple'
-                  ? 'highlight'
-                  : seat.tier === 'accessible'
-                  ? 'outline'
-                  : 'format';
+                    ? 'highlight'
+                    : seat.tier === 'accessible'
+                      ? 'outline'
+                      : 'format';
 
               return (
                 <View key={seat.id} style={styles.seatChip}>
@@ -573,10 +649,10 @@ export default function CheckoutPreviewScreen() {
                       seat.tier === 'vip'
                         ? 'VIP'
                         : seat.tier === 'couple'
-                        ? 'Couple'
-                        : seat.tier === 'accessible'
-                        ? 'Access'
-                        : 'Standard'
+                          ? 'Couple'
+                          : seat.tier === 'accessible'
+                            ? 'Access'
+                            : 'Standard'
                     }
                     variant={tierBadgeVariant}
                     size="sm"
@@ -598,12 +674,14 @@ export default function CheckoutPreviewScreen() {
           <View style={styles.cardHeaderRow}>
             <Ionicons name="person-outline" size={18} color={colors.primary} />
             <Text variant="heading2" color="textPrimary" style={styles.cardTitle}>
-              Customer Details (Test Session)
+              {isLive ? 'Customer Details (Staging Reservation)' : 'Customer Details (Test Session)'}
             </Text>
           </View>
 
           <Text variant="caption" color="textSecondary" style={styles.inputSectionSubtext}>
-            Enter simulated customer details for order receipt confirmation:
+            {isLive
+              ? 'Enter contact details for the staging reservation:'
+              : 'Enter simulated customer details for order receipt confirmation:'}
           </Text>
 
           <Input
@@ -636,7 +714,7 @@ export default function CheckoutPreviewScreen() {
           <View style={styles.cardHeaderRow}>
             <Ionicons name="receipt-outline" size={18} color={colors.primary} />
             <Text variant="heading2" color="textPrimary" style={styles.cardTitle}>
-              Price Breakdown (Simulated NGN)
+              {isLive ? 'Price Breakdown (NGN)' : 'Price Breakdown (Simulated NGN)'}
             </Text>
           </View>
 
@@ -658,10 +736,10 @@ export default function CheckoutPreviewScreen() {
 
           <View style={styles.receiptLineRow}>
             <Text variant="supporting" color="textSecondary">
-              Convenience Fee (Preview):
+              {isLive ? 'Convenience Fee:' : 'Convenience Fee (Preview):'}
             </Text>
             <Text variant="supporting" color="highlight" style={styles.receiptAmount}>
-              &#8358;0 (Free Demo)
+              {isLive ? <>&#8358;0 (Payment Disabled)</> : <>&#8358;0 (Free Demo)</>}
             </Text>
           </View>
 
@@ -683,7 +761,7 @@ export default function CheckoutPreviewScreen() {
         </Card>
 
         {/* Interactive Simulation Actions Card */}
-        <Card variant="elevated" padding="base" style={styles.simulationCard}>
+        {!isLive && <Card variant="elevated" padding="base" style={styles.simulationCard}>
           <View style={styles.cardHeaderRow}>
             <Ionicons name="play-circle-outline" size={20} color={colors.highlight} />
             <Text variant="heading2" color="textPrimary" style={styles.cardTitle}>
@@ -727,10 +805,10 @@ export default function CheckoutPreviewScreen() {
               accessibilityLabel="Simulate card decline and retry experience"
             />
           </View>
-        </Card>
+        </Card>}
 
         {/* Demonstration States Static Explorer */}
-        <Card variant="surface" padding="base" style={styles.demoPlaygroundCard}>
+        {!isLive && <Card variant="surface" padding="base" style={styles.demoPlaygroundCard}>
           <View style={styles.cardHeaderRow}>
             <Ionicons name="flask-outline" size={18} color={colors.highlight} />
             <Text variant="heading2" color="textPrimary" style={styles.cardTitle}>
@@ -814,7 +892,7 @@ export default function CheckoutPreviewScreen() {
               </View>
             </TouchableOpacity>
           </View>
-        </Card>
+        </Card>}
       </ScrollView>
 
       {/* Sticky Bottom Actions Footer */}
@@ -830,7 +908,7 @@ export default function CheckoutPreviewScreen() {
           </View>
 
           <Button
-            title={isProcessing ? 'Processing...' : holdExpired ? 'Hold Expired' : 'Simulate Payment'}
+            title={isProcessing ? 'Processing...' : holdExpired ? 'Hold Expired' : isLive ? 'Create Staging Reservation' : 'Simulate Payment'}
             variant="primary"
             size="md"
             disabled={isProcessing || holdExpired}
@@ -841,10 +919,10 @@ export default function CheckoutPreviewScreen() {
                 <Ionicons name="card-outline" size={16} color={colors.background} />
               )
             }
-            onPress={() => handleExecuteSimulatedCheckout('succeeded')}
+            onPress={isLive ? handleExecuteLiveCheckout : () => handleExecuteSimulatedCheckout('succeeded')}
             accessible={true}
             accessibilityRole="button"
-            accessibilityLabel="Simulate test payment"
+            accessibilityLabel={isLive ? 'Create staging reservation' : 'Simulate test payment'}
           />
         </View>
       </View>
@@ -863,18 +941,20 @@ export default function CheckoutPreviewScreen() {
               <View style={styles.modalBadgeRow}>
                 <Badge
                   label={
-                    simulationResult.outcome === 'succeeded'
-                      ? 'SIMULATED SUCCESS'
-                      : simulationResult.outcome === 'failed'
-                      ? 'SIMULATED DECLINE'
-                      : 'HOLD EXPIRED'
+                    simulationResult.outcome === 'pending_payment'
+                      ? 'STAGING RESERVATION'
+                      : simulationResult.outcome === 'succeeded'
+                        ? 'SIMULATED SUCCESS'
+                        : simulationResult.outcome === 'failed'
+                          ? 'SIMULATED DECLINE'
+                          : 'HOLD EXPIRED'
                   }
                   variant={
-                    simulationResult.outcome === 'succeeded'
+                    simulationResult.outcome === 'pending_payment' || simulationResult.outcome === 'succeeded'
                       ? 'highlight'
                       : simulationResult.outcome === 'failed'
-                      ? 'status'
-                      : 'outline'
+                        ? 'status'
+                        : 'outline'
                   }
                   size="sm"
                 />
@@ -886,47 +966,51 @@ export default function CheckoutPreviewScreen() {
                   styles.modalIconBox,
                   {
                     borderColor:
-                      simulationResult.outcome === 'succeeded'
+                      simulationResult.outcome === 'pending_payment' || simulationResult.outcome === 'succeeded'
                         ? '#4CAF50'
                         : simulationResult.outcome === 'failed'
-                        ? '#F44336'
-                        : colors.highlight,
+                          ? '#F44336'
+                          : colors.highlight,
                   },
                 ]}
               >
                 <Ionicons
                   name={
-                    simulationResult.outcome === 'succeeded'
+                    simulationResult.outcome === 'pending_payment' || simulationResult.outcome === 'succeeded'
                       ? 'checkmark-circle'
                       : simulationResult.outcome === 'failed'
-                      ? 'alert-circle'
-                      : 'time-outline'
+                        ? 'alert-circle'
+                        : 'time-outline'
                   }
                   size={42}
                   color={
-                    simulationResult.outcome === 'succeeded'
+                    simulationResult.outcome === 'pending_payment' || simulationResult.outcome === 'succeeded'
                       ? '#4CAF50'
                       : simulationResult.outcome === 'failed'
-                      ? '#F44336'
-                      : colors.highlight
+                        ? '#F44336'
+                        : colors.highlight
                   }
                 />
               </View>
 
               {/* Title & Subtitle */}
               <Text variant="heading1" color="textPrimary" align="center" style={styles.modalTitle}>
-                {simulationResult.outcome === 'succeeded'
+                {simulationResult.outcome === 'pending_payment'
+                  ? 'Staging reservation created'
+                  : simulationResult.outcome === 'succeeded'
                   ? 'Simulated payment successful'
                   : simulationResult.outcome === 'failed'
-                  ? 'Simulated payment failed (card declined)'
-                  : 'Seat hold has expired'}
+                    ? 'Simulated payment failed (card declined)'
+                    : 'Seat hold has expired'}
               </Text>
               <Text variant="body" color="textSecondary" align="center" style={styles.modalSubtitle}>
-                {simulationResult.outcome === 'succeeded'
+                {simulationResult.outcome === 'pending_payment'
+                  ? 'The real staging booking is pending payment. No payment gateway was activated.'
+                  : simulationResult.outcome === 'succeeded'
                   ? 'Your test order was processed in offline simulation mode. No live credit card was charged.'
                   : simulationResult.outcome === 'failed'
-                  ? 'Simulated issuing bank declined the card authorization. You can retry with your preserved hold.'
-                  : 'Seat hold has expired. Please select seats again.'}
+                    ? 'Simulated issuing bank declined the card authorization. You can retry with your preserved hold.'
+                    : 'Seat hold has expired. Please select seats again.'}
               </Text>
 
               {/* Details Box */}
@@ -953,7 +1037,7 @@ export default function CheckoutPreviewScreen() {
 
                 <View style={styles.contextLine}>
                   <Text variant="caption" color="textSecondary">
-                    Simulated Amount:
+                      {isLive ? 'Staging Amount:' : 'Simulated Amount:'}
                   </Text>
                   <Text variant="caption" color="primary" style={styles.contextValueBold}>
                     {formattedTotal}
@@ -966,7 +1050,7 @@ export default function CheckoutPreviewScreen() {
                       Preserved Session:
                     </Text>
                     <Text variant="caption" color="textPrimary" style={styles.contextValueBold}>
-                      {idempotencyKeyRef.current.substring(0, 16)}...
+                      {idempotencyKey.substring(0, 16)}...
                     </Text>
                   </View>
                 )}
@@ -976,11 +1060,13 @@ export default function CheckoutPreviewScreen() {
               <View style={styles.modalExplanationBox}>
                 <Ionicons name="information-circle-outline" size={16} color={colors.highlight} />
                 <Text variant="caption" color="textSecondary" style={styles.modalExplanationText}>
-                  {simulationResult.outcome === 'succeeded'
+                  {simulationResult.outcome === 'pending_payment'
+                    ? 'REAL STAGING BOOKING: PostgreSQL reservation created; payment is disabled and no QR ticket is issued.'
+                    : simulationResult.outcome === 'succeeded'
                     ? 'NOTICE: Offline simulation only. No live database ticket or live QR code was created.'
                     : simulationResult.outcome === 'failed'
-                    ? 'Idempotency key retained. Retrying will not allocate duplicate tickets.'
-                    : 'Holds release automatically upon timeout to free inventory for other moviegoers.'}
+                      ? 'Idempotency key retained. Retrying will not allocate duplicate tickets.'
+                      : 'Holds release automatically upon timeout to free inventory for other moviegoers.'}
                 </Text>
               </View>
 
