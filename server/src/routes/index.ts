@@ -6,6 +6,8 @@ import showtimesRouter from './showtimes.js';
 import holdsRouter from './holds.js';
 import bookingsRouter from './bookings.js';
 import paymentsRouter from './payments.js';
+import staffAuthRouter from './staffAuth.js';
+import ticketsRouter from './tickets.js';
 
 const apiRouter = Router();
 
@@ -26,5 +28,8 @@ apiRouter.use('/bookings', bookingsRouter);
 // Test payment endpoints (Milestone M05.6)
 apiRouter.use('/payments', paymentsRouter);
 
-export default apiRouter;
+// Staff authentication and admission scanner endpoints.
+apiRouter.use('/staff-auth', staffAuthRouter);
+apiRouter.use('/tickets', ticketsRouter);
 
+export default apiRouter;
