@@ -1,9 +1,32 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vitest';
 import { app } from '../src/app.js';
+import { prisma } from '../src/db.js';
 import { testRequest } from './helpers/testRequest.js';
 
+const liveDiscoveryTestsEnabled = process.env.RUN_LIVE_DISCOVERY_TESTS === 'true';
+
+beforeAll(async () => {
+  if (!liveDiscoveryTestsEnabled) {
+    console.info(
+      '[SKIP] Live discovery integration tests are disabled. Set RUN_LIVE_DISCOVERY_TESTS=true to run them against an explicitly configured test database.'
+    );
+    return;
+  }
+
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+  } catch {
+    throw new Error(
+      'Live discovery integration tests were enabled, but the configured test database is unavailable.'
+    );
+  }
+});
+
 describe('Live Neon Database Discovery Verification', () => {
-  it('GET /api/v1/movies returns seeded catalog movies with pagination', async () => {
+  it('GET /api/v1/movies returns seeded catalog movies with pagination', async (ctx) => {
+    if (!liveDiscoveryTestsEnabled) {
+      ctx.skip();
+    }
     const res = await testRequest(app, {
       method: 'GET',
       url: '/api/v1/movies?limit=10',
@@ -19,7 +42,10 @@ describe('Live Neon Database Discovery Verification', () => {
     expect(titles).toContain('Interstellar');
   });
 
-  it('GET /api/v1/movies supports category filtering', async () => {
+  it('GET /api/v1/movies supports category filtering', async (ctx) => {
+    if (!liveDiscoveryTestsEnabled) {
+      ctx.skip();
+    }
     const res = await testRequest(app, {
       method: 'GET',
       url: '/api/v1/movies?category=now_showing',
@@ -32,7 +58,10 @@ describe('Live Neon Database Discovery Verification', () => {
     }
   });
 
-  it('GET /api/v1/movies/:id returns movie details for seeded movie', async () => {
+  it('GET /api/v1/movies/:id returns movie details for seeded movie', async (ctx) => {
+    if (!liveDiscoveryTestsEnabled) {
+      ctx.skip();
+    }
     const res = await testRequest(app, {
       method: 'GET',
       url: '/api/v1/movies/mov-dune-2',
@@ -45,7 +74,10 @@ describe('Live Neon Database Discovery Verification', () => {
     expect(res.body.data.runtime).toBe(166);
   });
 
-  it('GET /api/v1/movies/:id returns 404 for unknown movie', async () => {
+  it('GET /api/v1/movies/:id returns 404 for unknown movie', async (ctx) => {
+    if (!liveDiscoveryTestsEnabled) {
+      ctx.skip();
+    }
     const res = await testRequest(app, {
       method: 'GET',
       url: '/api/v1/movies/non-existent-movie-id',
@@ -56,7 +88,10 @@ describe('Live Neon Database Discovery Verification', () => {
     expect(res.body.code).toBe('MOVIE_NOT_FOUND');
   });
 
-  it('GET /api/v1/cinemas returns seeded Lagos cinemas with auditorium counts', async () => {
+  it('GET /api/v1/cinemas returns seeded Lagos cinemas with auditorium counts', async (ctx) => {
+    if (!liveDiscoveryTestsEnabled) {
+      ctx.skip();
+    }
     const res = await testRequest(app, {
       method: 'GET',
       url: '/api/v1/cinemas',
@@ -79,7 +114,10 @@ describe('Live Neon Database Discovery Verification', () => {
     }
   });
 
-  it('GET /api/v1/cinemas/:id/showtimes returns real showtimes with bookability info', async () => {
+  it('GET /api/v1/cinemas/:id/showtimes returns real showtimes with bookability info', async (ctx) => {
+    if (!liveDiscoveryTestsEnabled) {
+      ctx.skip();
+    }
     const res = await testRequest(app, {
       method: 'GET',
       url: '/api/v1/cinemas/cin-lekki-imax/showtimes',
@@ -104,7 +142,10 @@ describe('Live Neon Database Discovery Verification', () => {
     expect(firstShowtime.pricing.couplePairPriceKobo).toBe(1200000);
   });
 
-  it('GET /api/v1/cinemas/:id/showtimes returns 404 for unknown cinema', async () => {
+  it('GET /api/v1/cinemas/:id/showtimes returns 404 for unknown cinema', async (ctx) => {
+    if (!liveDiscoveryTestsEnabled) {
+      ctx.skip();
+    }
     const res = await testRequest(app, {
       method: 'GET',
       url: '/api/v1/cinemas/unknown-cinema-id/showtimes',
@@ -115,7 +156,10 @@ describe('Live Neon Database Discovery Verification', () => {
     expect(res.body.code).toBe('CINEMA_NOT_FOUND');
   });
 
-  it('GET /api/v1/cinemas/:id/showtimes accurately marks empty auditoriums as non-bookable', async () => {
+  it('GET /api/v1/cinemas/:id/showtimes accurately marks empty auditoriums as non-bookable', async (ctx) => {
+    if (!liveDiscoveryTestsEnabled) {
+      ctx.skip();
+    }
     // Genesis Palms has an OPEN_FOR_BOOKING showtime but 0 physical seats
     const res = await testRequest(app, {
       method: 'GET',
@@ -135,7 +179,10 @@ describe('Live Neon Database Discovery Verification', () => {
   });
 
   describe('Showtime Seat Inventory API (/api/v1/showtimes/:id/seats)', () => {
-    it('returns exact 320-seat layout for Filmhouse reference hall with accurate occupancy and pricing', async () => {
+    it('returns exact 320-seat layout for Filmhouse reference hall with accurate occupancy and pricing', async (ctx) => {
+      if (!liveDiscoveryTestsEnabled) {
+        ctx.skip();
+      }
       const res = await testRequest(app, {
         method: 'GET',
         url: '/api/v1/showtimes/st-dune-lekki-1430/seats',
@@ -206,7 +253,10 @@ describe('Live Neon Database Discovery Verification', () => {
       }
     });
 
-    it('returns empty inventory cleanly for auditorium with zero physical seats', async () => {
+    it('returns empty inventory cleanly for auditorium with zero physical seats', async (ctx) => {
+      if (!liveDiscoveryTestsEnabled) {
+        ctx.skip();
+      }
       const res = await testRequest(app, {
         method: 'GET',
         url: '/api/v1/showtimes/st-dune-genesis-1600/seats',
@@ -224,7 +274,10 @@ describe('Live Neon Database Discovery Verification', () => {
       expect(data.seats).toEqual([]);
     });
 
-    it('returns 404 for non-existent showtime', async () => {
+    it('returns 404 for non-existent showtime', async (ctx) => {
+      if (!liveDiscoveryTestsEnabled) {
+        ctx.skip();
+      }
       const res = await testRequest(app, {
         method: 'GET',
         url: '/api/v1/showtimes/st-non-existent-id/seats',
